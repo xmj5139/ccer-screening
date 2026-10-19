@@ -1,0 +1,35 @@
+# Runtime data and private configuration
+/data/
+/logs/
+/output/
+/node_modules/
+/.graphflow/
+/.graphflow-cache/
+/.playwright-cli/
+/.dsh/
+.env
+.env.*
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.log
+*.pem
+*.key
+*.p12
+*.pfx
+*.bundle
+*.tar
+*.tar.gz
+*.zip
+
+# Generated reports, screenshots and scratch exports
+/docs/*
+!/docs/*.md
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
+desktop.ini

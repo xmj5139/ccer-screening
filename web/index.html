@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>CCER 投资筛选 AI 应用 · 工作台</title>
+<link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+<div id="boot" class="boot">正在加载工作台…</div>
+
+<header class="topbar" id="topbar" hidden>
+  <div class="brand">
+    <span class="logo">CCER</span>
+    <div class="brand-text">
+      <strong>投资筛选 AI 应用</strong>
+      <small>政策与方法学跟踪 · 项目初筛 · 条件检查 · 可追溯减排量初算</small>
+    </div>
+  </div>
+  <nav class="tabs" id="nav"></nav>
+  <div class="userbox">
+    <span class="who" id="user-select" title="当前登录身份（只读，不可切换）"></span>
+    <button class="logout" id="logout-btn" type="button" title="结束服务端会话并返回登录面板">退出登录</button>
+    <span class="gate" id="gate-badge" title="计算门禁：业务测算需方法学审批通过且无占位系数、无缺条款页码"></span>
+  </div>
+</header>
+
+<div class="disclaimer" id="disclaimer" hidden>
+  <strong>使用边界：</strong>本应用是投资筛选与研究辅助工具，输出「候选方法学、条件判断、证据缺口、情景估算、投资关注点」，供分析师复核。
+  不替代项目业主、审定与核查机构、注册登记机构的工作；不把预计减排量、核查量、登记量、签发量或可交易量混为一谈。
+  情景估算不得称为「预计可签发量」。
+</div>
+
+<main id="view" class="view" hidden></main>
+<div id="toast" class="toast" hidden></div>
+
+<script src="/app.js" type="module"></script>
+</body>
+</html>

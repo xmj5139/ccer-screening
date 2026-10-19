@@ -1,0 +1,6 @@
+import {readFileSync} from 'node:fs';import {setupV2,test,assert,assertEqual,finish} from './v2-helpers.mjs';
+await setupV2();const p=await import('../src/services/accounting-parse.mjs');const f=n=>readFileSync(new URL('./fixtures/accounting/'+n+'.md',import.meta.url),'utf8');
+for(const kind of ['general','power'])test('Actual '+kind+' FAQ: six paired answers without sidebar pollution',()=>{const r=p.parseCetsFaqPage(f('cets-'+kind+'-faq'));assertEqual(r.qa.length,6);assert(r.announced_count>r.qa.length);assert(r.qa.every(x=>x.question.endsWith('？')&&x.answer.length>5&&!/网站地图|技术支持|ICP备案/.test(x.answer)));assert(!r.qa[0].question.includes('注册登记系统相关问题'));});
+test('Article metadata keeps publication distinct from issue date, source does not absorb controls',()=>{const r=p.parseCetsArticlePage(f('cets-forest-v02'));assertEqual(r.issuer,'生态环境部');assertEqual(r.published_at,'2026-10-10');assert(r.body_text.includes('30天后'));assert(!r.body_text.includes('ICP备案'));});
+test('An actual article without H1 still has complete content after print controls',()=>{const r=p.parseCetsArticlePage(f('cets-article-no-h1'));assert(r.title.includes('发展新质生产力'));assertEqual(r.issuer,'新华社');assert(r.body_text.length>3000);assert(r.body_text.includes('全国碳市场'));assert(!r.body_text.includes('业务审核单位'));});
+finish('61-v2-cets-public-independent.test.mjs');
