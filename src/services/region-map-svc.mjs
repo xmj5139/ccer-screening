@@ -16,7 +16,7 @@
  * 本模块不访问外网、不读取凭据、不生成任何排放数字。没有证据就是 null。
  */
 import { createHash } from 'node:crypto';
-import { all, get, run, tx, audit, dbPath } from '../core/db.mjs';
+import { all, get, run, tx, audit, dbPath, getMeta, getDb } from '../core/db.mjs';
 import { newId, nowIso, todayCst } from '../core/util.mjs';
 import {
   PROVINCES, PROVINCE_CODES, REGION_GROUPS, regionCatalog,
@@ -681,7 +681,9 @@ function directoryAggregates(requestedYear = null) {
   for (const row of rows) {
     const year = Number(row.list_year);
     if (!Number.isInteger(year) || !years.includes(year)) continue;
-    const province = normalizeProvince(row.province);
+    // The project map uses geographical aliases; directory jurisdiction is separate.
+    const isCorps = ['新疆生产建设兵团', '新疆建设兵团', '新疆兵团'].includes(String(row.province || '').trim());
+    const province = isCorps ? null : normalizeProvince(row.province);
     const creditCode = String(row.credit_code || '').trim().toUpperCase();
     const key = creditCode
       || String(row.entity_key || '').trim()
@@ -814,7 +816,16 @@ function directoryRegionDetail(directory, province) {
     };
   }).sort((a, b) => b.count - a.count || String(a.source_code || a.source_url).localeCompare(String(b.source_code || b.source_url))) : [];
   const sectors = [...(key ? directory.sector_sets.get(key) || [] : [])];
-  const missingSectors = NATIONAL_ETS_SECTORS.filter((s) => !sectors.includes(s));
+  // Explicit scope confirmations are separate from missing data and entity rows.
+  let confirmations = [];
+  try { confirmations = JSON.parse(getMeta(getDb(), 'cea_directory_coverage_confirmations') || '[]'); } catch { /* older metadata */ }
+  if (!Array.isArray(confirmations)) confirmations = [];
+  const notApplicable = confirmations.filter((c) => Number(c.list_year) === year
+    && normalizeProvince(c.province)?.code === province.code
+    && c.status === 'not_applicable' && NATIONAL_ETS_SECTORS.includes(c.sector)
+    && !sectors.includes(c.sector));
+  const missingSectors = NATIONAL_ETS_SECTORS.filter((s) => !sectors.includes(s)
+    && !notApplicable.some((c) => c.sector === s));
   const asOf = key ? directory.as_of_by_year_province.get(key) || null : null;
   const note = count === null || count === 0
     ? `本平台尚未收录该省 ${year || ''} 年名录；不补 0，不代表该省没有重点排放单位。`
@@ -822,6 +833,7 @@ function directoryRegionDetail(directory, province) {
       + (missingSectors.length
         ? `仅取得${sectors.length ? sectors.join('、') : '未标注'}行业名单；${missingSectors.join('、')}行业名单尚未取得；`
         : `已取得${sectors.join('、')}行业名单；`)
+      + notApplicable.map((c) => `${c.sector}无企业（${c.basis === 'user_confirmed' ? '用户确认' : '来源确认'}）；`).join('')
       + '不代表全省或全国完整数量。';
   return {
     available: Boolean(year && count !== null),
@@ -833,6 +845,7 @@ function directoryRegionDetail(directory, province) {
     source_count: sources.length,
     sectors,
     missing_sectors: missingSectors,
+    not_applicable_sectors: notApplicable,
     as_of: asOf,
     province_label: province.name,
     coverage_note: note,
@@ -1211,10 +1224,10 @@ export function buildRegionMap(query = {}) {
       display = value === null ? '未收录' : formatEntityCount(value);
       missing = value === null;
       source = dirDetail.sources.length ? {
-        source_name: `省级生态环境主管部门公开名录（${dirDetail.sources.length} 份）`,
+        source_name: `公开名录及补充原件（${dirDetail.sources.length} 份）`,
         source_url: dirDetail.sources[0]?.source_url || null,
-        source_kind: 'official',
-        source_kind_label: '官方公开名录',
+        source_kind: 'platform',
+        source_kind_label: '公开名录（含确认转载及上传原件）',
         methodology: '按统一社会信用代码 + 名录年度去重',
         boundary: '本平台已收录，非全国/全省完整数量',
         verification_status: 'source_recorded',
@@ -1309,10 +1322,10 @@ export function buildRegionMap(query = {}) {
     ? (directory.selected_unknown || [])
     : (directory.unknown || []);
   const directorySourceSummary = {
-    source_name: '省级生态环境主管部门公开名录',
+    source_name: '公开名录及补充原件（逐条保留原始来源）',
     source_url: directory.sources?.[0]?.source_url || null,
-    source_kind: 'official',
-    source_kind_label: '官方公开名录',
+    source_kind: 'platform',
+    source_kind_label: '公开名录（含确认转载及上传原件）',
     verification_status: 'source_recorded',
     data_as_of: directoryAsOf,
     source_count: directory.sources?.length || 0,
@@ -1365,7 +1378,7 @@ export function buildRegionMap(query = {}) {
         count: unknownDirectory.reduce((s, u) => s + u.count, 0),
         items: unknownDirectory,
         note: unknownDirectory.length
-          ? '名录中的省份文本无法归并，未计入 34 地区。'
+          ? '这些名录按原辖区单列，未计入34省级地区底图；新疆生产建设兵团不强行合并到新疆自治区。'
           : null,
       },
     },
@@ -1644,7 +1657,7 @@ export function buildRegionMapExport(query = {}) {
         ? view.coverage.project_scope
         : view.coverage.emission_scope,
     来源: isDirectory
-      ? `省级生态环境主管部门公开名录（${view.directory_summary?.source_count ?? 0} 份）`
+      ? `公开名录及补充原件（${view.directory_summary?.source_count ?? 0} 份，含确认转载）`
       : (view.source?.source_name || '本平台公开项目库'),
     说明: [
       ...view.notes,

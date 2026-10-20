@@ -3,6 +3,14 @@
  */
 export const CEA_ENTITY_PUBLIC_SOURCES = [
   {
+    code: 'cea_entity_cets_public_portal',
+    name: '全国碳市场信息网重点排放单位信息公开',
+    url: 'https://www.cets.org.cn/zdpfdwxxgk/index.jhtml',
+    dataset: 'entity', kind: 'official_portal', authority: '全国碳市场信息网',
+    allowed_domains: ['www.cets.org.cn'], priority: 80, enabled: true,
+    note: '公开名录补查入口。2026-10-20经已配置Firecrawl可读页面，但企业查询表仍为动态模板，未取得有效行。模板为空不代表没有企业；不能将导航、占位行或公开状态汇总当企业明细。',
+  },
+  {
     "code": "cea_entity_public_shanghai",
     "name": "上海2026年度全国碳市场重点排放单位名录（发电、钢铁）",
     "url": "https://sthj.sh.gov.cn/hbzhywpt2025/20251027/a4a1e57c3e6c4d228563b8eef025b91b.html",

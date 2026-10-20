@@ -240,7 +240,8 @@ export function classForValue(value, scale) {
 
 export function scaleBins(scale, metric) {
   if (!scale || scale.empty) return [];
-  const fmt = (v) => (PROJECT_METRICS.includes(metric) ? `${Number(v).toLocaleString('zh-CN')}` : formatTco2(v));
+  const fmt = (v) => DIRECTORY_METRICS.includes(metric) ? formatEntityCount(v)
+    : PROJECT_METRICS.includes(metric) ? `${Number(v).toLocaleString('zh-CN')}` : formatTco2(v);
   if (!scale.breaks.length) {
     if (scale.singlePositive !== null && scale.singlePositive !== undefined) {
       return [{ cls: 'heat-2', label: `正值 ${fmt(scale.singlePositive)}` }];
@@ -759,7 +760,7 @@ function detailRows(data, region, metric) {
     return rows.map(([k, v]) => `<div class="region-kv"><dt>${esc(k)}</dt><dd>${esc(v)}</dd></div>`).join('');
   }
   rows.push(['指标', isProject ? `${metaLabel}（当前收录快照）` : `${metaLabel}｜${yearLabel(data)}`]);
-  rows.push(['单位', isProject ? '个' : 'tCO2（页面按万吨/亿吨换算）']);
+  rows.push(['单位', isProject ? '个' : isDirectory ? '家' : 'tCO2（页面按万吨/亿吨换算）']);
   rows.push([isProject ? '公开项目（当前快照）' : '公开项目（当前快照，不随排放年度变化）',
     `${region.project_count} 个（登记 ${region.registered_count}｜减排量登记 ${region.reduction_registered_count}）`]);
   if (!isProject) {
