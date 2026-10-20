@@ -12,6 +12,7 @@
  *   3. 每条基础数据的 provenance 必须说明具体来源（URL + 该事实在哪个文件里），
  *      不能写「来自官方」这类不可核对的说明。
  */
+import { CEA_ENTITY_PUBLIC_SOURCES } from './cea-entity-public-sources.mjs';
 
 /** 各来源允许出站的域名白名单（写入 cea_source.allowed_domains） */
 const DOMAINS = {
@@ -111,7 +112,7 @@ export const CEA_JSON_SOURCES = [
 /** 官方来源清单。`dataset` 决定采集器如何使用该来源。
  * priority 数值越小越优先（同一 dataset 内先试高优先级来源）。
  * 公开 JSON 通道（CEA_JSON_SOURCES）追加在 HTML/PDF 来源之后。 */
-export const CEA_SOURCES = [
+const BASE_CEA_SOURCES = [
   {
     code: 'cea_daily_2026',
     name: '全国碳排放配额每日概况（2026 年目录）',
@@ -272,6 +273,22 @@ export const CEA_SOURCES = [
   // 官网公开 JSON 通道（与 HTML/PDF 来源并存，互不替代）
   ...CEA_JSON_SOURCES,
 ];
+
+/**
+ * Codex 持续补入的已核实公开名录来源（src/data/cea-entity-public-sources.mjs）。
+ * 本文件只负责接线：不覆盖、不猜测、不改写该文件中的 URL/白名单。
+ * 若 Codex 登记了与既有来源相同的 code，以该文件的登记为准（URL 变更仍需
+ * ensureCeaSources 审计留痕），并按 code 去重，避免重复采集。
+ */
+const CEA_SOURCE_MAP = new Map();
+for (const source of [
+  ...BASE_CEA_SOURCES,
+  ...(Array.isArray(CEA_ENTITY_PUBLIC_SOURCES) ? CEA_ENTITY_PUBLIC_SOURCES : []),
+]) {
+  if (!source?.code) continue;
+  CEA_SOURCE_MAP.set(source.code, source.dataset ? source : { ...source, dataset: 'entity' });
+}
+export const CEA_SOURCES = [...CEA_SOURCE_MAP.values()];
 
 /**
  * 基础数据：**已由公开官方文件确认的元数据**（不含行情数值）。

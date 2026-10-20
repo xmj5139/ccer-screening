@@ -20,7 +20,7 @@
 import { all, get, run, tx, audit } from '../core/db.mjs';
 import { newId, nowIso, todayCst, round, j, uj, isDate } from '../core/util.mjs';
 import { CEA_SOURCES, CEA_DOCUMENTS, CEA_EVENTS, CEA_DEFAULTS, CEA_SCENARIO_NOTE } from '../data/cea-sources.mjs';
-import { deriveDaily, runDailyChecks } from './cea-parse.mjs';
+import { deriveDaily, runDailyChecks, entitySectorTags } from './cea-parse.mjs';
 
 export const CEA_PRICE_REGIME_2026 = 'CEA_COMPOSITE_2026';
 export const CEA_INSTRUMENT = 'CEA';
@@ -1693,11 +1693,105 @@ export function upsertCeaEvent(patch = {}, { actor = 'system:cea-collect' } = {}
 
 /* ------------------------------ 企业名录 ------------------------------ */
 
+// 明确等价省名：只做整名替换，不做 LIKE 模糊匹配任意文本。
+const CEA_PROVINCE_ALIASES = [
+  ['北京', '北京市'], ['天津', '天津市'], ['河北', '河北省'], ['山西', '山西省'],
+  ['内蒙古', '内蒙古自治区'], ['辽宁', '辽宁省'], ['吉林', '吉林省'], ['黑龙江', '黑龙江省'],
+  ['上海', '上海市'], ['江苏', '江苏省'], ['浙江', '浙江省'], ['安徽', '安徽省'],
+  ['福建', '福建省'], ['江西', '江西省'], ['山东', '山东省'], ['河南', '河南省'],
+  ['湖北', '湖北省'], ['湖南', '湖南省'], ['广东', '广东省'], ['广西', '广西壮族自治区'],
+  ['海南', '海南省'], ['重庆', '重庆市'], ['四川', '四川省'], ['贵州', '贵州省'],
+  ['云南', '云南省'], ['西藏', '西藏自治区'], ['陕西', '陕西省'], ['甘肃', '甘肃省'],
+  ['青海', '青海省'], ['宁夏', '宁夏回族自治区'], ['新疆', '新疆维吾尔自治区'],
+  ['台湾', '台湾省'], ['香港', '香港特别行政区'], ['澳门', '澳门特别行政区'],
+];
+
+function ceaProvinceFilterValues(value) {
+  const s = String(value || '').trim();
+  if (!s) return [];
+  const group = CEA_PROVINCE_ALIASES.find((g) => g.includes(s));
+  return group ? [...new Set(group)] : [s];
+}
+
+function entityMembershipSectors(patch = {}) {
+  const values = [
+    ...(Array.isArray(patch.sectors) ? patch.sectors : []),
+    patch.sector,
+  ];
+  if (Array.isArray(patch.row_sources)) {
+    for (const ref of patch.row_sources) values.push(ref?.sector);
+  }
+  return entitySectorTags(values);
+}
+
+function entityMembershipNote(patch = {}, sector = null) {
+  const refs = Array.isArray(patch.row_sources) ? patch.row_sources : [];
+  let selected = refs.filter((ref) => {
+    const tags = entitySectorTags(ref?.sector);
+    return sector ? tags.includes(sector) : tags.length === 0;
+  });
+  if (!selected.length) selected = refs;
+  const notes = [...new Set(selected.map((ref) => String(ref?.note || '').trim()).filter(Boolean))];
+  return notes.length ? notes.join('；') : (patch.note || null);
+}
+
+/** 同源同行业成员关系幂等；来源/快照/哈希/备注只更新本来源，不影响其他来源。 */
+function upsertCeaEntityMembership(entityId, patch = {}, now = nowIso()) {
+  if (!patch.source_code) return 0;
+  const sectors = entityMembershipSectors(patch);
+  const rows = sectors.length ? sectors.map((sector) => ({ sector })) : [{ sector: null }];
+  let changed = 0;
+  for (const row of rows) {
+    const note = entityMembershipNote(patch, row.sector);
+    const ex = get(
+      `SELECT id FROM cea_entity_membership
+        WHERE entity_id=? AND source_code=? AND COALESCE(sector,'')=?`,
+      [entityId, patch.source_code, row.sector || '']
+    );
+    if (ex) {
+      run(
+        `UPDATE cea_entity_membership
+            SET source_url=COALESCE(?,source_url), source_hash=COALESCE(?,source_hash),
+                snapshot_id=COALESCE(?,snapshot_id), note=COALESCE(?,note), updated_at=?
+          WHERE id=?`,
+        [patch.source_url ?? null, patch.source_hash ?? null, patch.snapshot_id ?? null,
+          note, now, ex.id]
+      );
+    } else {
+      run(
+        `INSERT INTO cea_entity_membership
+           (id,entity_id,source_code,sector,source_url,source_hash,snapshot_id,note,created_at,updated_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?)`,
+        [newId('CEAENTM'), entityId, patch.source_code, row.sector, patch.source_url ?? null,
+          patch.source_hash ?? null, patch.snapshot_id ?? null, note, now, now]
+      );
+    }
+    changed += 1;
+  }
+  return changed;
+}
+
+function aggregateEntityMembershipSector(entityId) {
+  const rows = all('SELECT sector FROM cea_entity_membership WHERE entity_id=? AND sector IS NOT NULL', [entityId]);
+  const tags = entitySectorTags(rows.map((r) => r.sector));
+  return tags.length ? tags.join('、') : null;
+}
+
 export function listCeaEntities(f = {}) {
   const where = [];
   const params = [];
-  if (f.province) { where.push('province=?'); params.push(f.province); }
-  if (f.sector) { where.push('sector=?'); params.push(f.sector); }
+  if (f.province) {
+    const provinceValues = ceaProvinceFilterValues(f.province);
+    if (provinceValues.length) {
+      where.push(`province IN (${provinceValues.map(() => '?').join(',')})`);
+      params.push(...provinceValues);
+    }
+  }
+  if (f.sector) {
+    // 主体聚合 sector 可能是「发电、钢铁」；筛选必须命中成员关系，而不是只比主体行最后值。
+    where.push('(sector=? OR EXISTS (SELECT 1 FROM cea_entity_membership m WHERE m.entity_id=cea_entity.id AND m.sector=?))');
+    params.push(f.sector, f.sector);
+  }
   if (f.list_year) { where.push('list_year=?'); params.push(Number(f.list_year)); }
   if (f.status) { where.push('status=?'); params.push(f.status); }
   if (f.q) { where.push('(name LIKE ? OR credit_code LIKE ?)'); params.push(`%${f.q}%`, `%${f.q}%`); }
@@ -1708,16 +1802,36 @@ export function listCeaEntities(f = {}) {
   const rows = all(`SELECT * FROM cea_entity ${clause} ORDER BY list_year DESC, province, name LIMIT ? OFFSET ?`, [
     ...params, limit, offset,
   ]);
+  // 多来源/多行业出处：每行都返回全部成员关系；原 source_url 字段保持不变以兼容调用方。
+  const memberships = new Map();
+  for (let i = 0; i < rows.length; i += 500) {
+    const ids = rows.slice(i, i + 500).map((r) => r.id);
+    if (!ids.length) continue;
+    const list = all(
+      `SELECT entity_id,source_code,sector,source_url,source_hash,snapshot_id,note,created_at,updated_at
+         FROM cea_entity_membership
+        WHERE entity_id IN (${ids.map(() => '?').join(',')})
+        ORDER BY entity_id, created_at, id`,
+      ids
+    );
+    for (const m of list) {
+      if (!memberships.has(m.entity_id)) memberships.set(m.entity_id, []);
+      memberships.get(m.entity_id).push(m);
+    }
+  }
+  for (const row of rows) row.source_memberships = memberships.get(row.id) || [];
   return {
     total, limit, offset, rows,
     coverage: {
+      as_of: get(`SELECT MAX(data_as_of) AS as_of FROM cea_entity ${clause}`, params)?.as_of || null,
       provinces: get('SELECT COUNT(DISTINCT province) AS c FROM cea_entity WHERE province IS NOT NULL')?.c || 0,
       list_years: all('SELECT DISTINCT list_year FROM cea_entity ORDER BY list_year DESC').map((r) => r.list_year),
       without_credit_code: get('SELECT COUNT(*) AS c FROM cea_entity WHERE credit_code IS NULL')?.c || 0,
     },
     note:
       '以统一社会信用代码 + 名录年度建立标识；名称变化保留来源，不合并集团旗下不同法人或分公司。' +
-      '名录数量不等于买家数量，也不代表企业实际盈缺。credit_code 为 null 表示公开名录未披露该字段。',
+      '名录数量不等于买家数量，也不代表企业实际盈缺；未披露的信用代码保持空白。' +
+      '保留同一主体的全部来源及行业出处；同一年度同一主体只计 1 条。',
   };
 }
 
@@ -1729,15 +1843,33 @@ export function upsertCeaEntity(patch = {}, { actor = 'system:cea-collect' } = {
   const creditCode = patch.credit_code ? String(patch.credit_code).trim().toUpperCase() : null;
   const entityKey = creditCode || `name:${name}`;
   const now = nowIso();
+  const sourceCode = String(patch.source_code || '').trim() || null;
   let ex = get('SELECT * FROM cea_entity WHERE entity_key=? AND list_year=?', [entityKey, listYear]);
   // 同一原始名录的重采可能暂时识别不出信用代码；不能新增同名重复行，也不抹去旧代码。
-  if (!ex && !creditCode && patch.source_code) ex = get('SELECT * FROM cea_entity WHERE name=? AND list_year=? AND source_code=?', [name, listYear, patch.source_code]);
-  const source = patch.source_code ? get('SELECT id FROM cea_source WHERE code=?', [patch.source_code]) : null;
+  if (!ex && !creditCode && sourceCode) ex = get('SELECT * FROM cea_entity WHERE name=? AND list_year=? AND source_code=?', [name, listYear, sourceCode]);
+  const source = sourceCode ? get('SELECT id FROM cea_source WHERE code=?', [sourceCode]) : null;
   if (ex) {
-    // 名称/行业/省份变化保留历史，不静默改写
+    // 有来源输入：本来源的行业成员关系独立保留，其他来源不删除；主体 sector 取全部成员关系并集。
+    if (sourceCode) upsertCeaEntityMembership(ex.id, { ...patch, source_code: sourceCode }, now);
+    let nextSector;
+    if (sourceCode) {
+      const aggregated = aggregateEntityMembershipSector(ex.id);
+      nextSector = aggregated || (patch.sector !== undefined ? patch.sector : ex.sector);
+    } else {
+      // 没有来源的既有编辑路径保持兼容：显式传入才改，否则保留原值。
+      nextSector = patch.sector !== undefined ? patch.sector : ex.sector;
+    }
+    const next = {
+      name,
+      province: patch.province !== undefined && patch.province !== null ? patch.province : ex.province,
+      city: patch.city !== undefined && patch.city !== null ? patch.city : ex.city,
+      sector: nextSector,
+      status: patch.status !== undefined && patch.status !== null ? patch.status : ex.status,
+    };
+    // 名称/行业/省份变化保留历史，不静默改写；行业并集新增标签也会留下修订。
     const diffs = ['name', 'province', 'city', 'sector', 'status']
-      .filter((k) => patch[k] !== undefined && String(patch[k] ?? '') !== String(ex[k] ?? ''))
-      .map((k) => ({ field: k, old: ex[k], next: patch[k] }));
+      .filter((k) => String(next[k] ?? '') !== String(ex[k] ?? ''))
+      .map((k) => ({ field: k, old: ex[k], next: next[k] }));
     for (const d of diffs) {
       run(
         `INSERT INTO cea_entity_revision (id,entity_id,revised_at,revised_by,field,old_value,new_value,reason,source_url)
@@ -1747,30 +1879,39 @@ export function upsertCeaEntity(patch = {}, { actor = 'system:cea-collect' } = {
       );
     }
     run(
-      `UPDATE cea_entity SET name=?,province=COALESCE(?,province),city=COALESCE(?,city),sector=COALESCE(?,sector),
-         status=COALESCE(?,status),source_id=COALESCE(?,source_id),source_url=COALESCE(?,source_url),
+      `UPDATE cea_entity SET name=?,province=?,city=?,sector=?,status=?,
+         source_id=COALESCE(?,source_id),source_url=COALESCE(?,source_url),
          source_code=COALESCE(?,source_code),snapshot_id=COALESCE(?,snapshot_id),source_hash=COALESCE(?,source_hash),
          data_as_of=COALESCE(?,data_as_of),note=COALESCE(?,note),updated_at=? WHERE id=?`,
       [
-        name, patch.province ?? null, patch.city ?? null, patch.sector ?? null, patch.status ?? null,
-        source?.id ?? null, patch.source_url ?? null, patch.source_code ?? null, patch.snapshot_id ?? null,
+        next.name, next.province, next.city, next.sector, next.status,
+        source?.id ?? null, patch.source_url ?? null, sourceCode, patch.snapshot_id ?? null,
         patch.source_hash ?? null, patch.data_as_of ?? null, patch.note ?? null, now, ex.id,
       ]
     );
     return { ok: true, id: ex.id, updated: true, revisions: diffs.length };
   }
   const id = newId('CEAENT');
+  const initialSectors = entityMembershipSectors(patch);
+  const initialSector = initialSectors.length ? initialSectors.join('、') : (patch.sector || null);
   run(
     `INSERT INTO cea_entity (id,entity_key,name,credit_code,province,city,sector,list_year,status,source_id,
        source_url,source_code,snapshot_id,source_hash,data_as_of,verify_status,note,created_at,updated_at)
      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'unverified',?,?,?)`,
     [
-      id, entityKey, name, creditCode, patch.province ?? null, patch.city ?? null, patch.sector ?? null,
+      id, entityKey, name, creditCode, patch.province ?? null, patch.city ?? null, initialSector,
       listYear, patch.status || 'existing', source?.id || null, patch.source_url || null,
-      patch.source_code || null, patch.snapshot_id || null, patch.source_hash || null,
+      sourceCode, patch.snapshot_id || null, patch.source_hash || null,
       patch.data_as_of || null, patch.note || null, now, now,
     ]
   );
+  if (sourceCode) {
+    upsertCeaEntityMembership(id, { ...patch, source_code: sourceCode }, now);
+    const aggregated = aggregateEntityMembershipSector(id);
+    if (aggregated && aggregated !== initialSector) {
+      run('UPDATE cea_entity SET sector=?, updated_at=? WHERE id=?', [aggregated, now, id]);
+    }
+  }
   return { ok: true, id, created: true };
 }
 
@@ -2000,6 +2141,7 @@ export const CEA_EXPORT_COLUMNS = {
     { key: 'data_as_of', label: '数据截止日' },
     { key: 'verify_status', label: '核验状态' },
     { key: 'source_url', label: '来源 URL' },
+    { key: 'notes', label: '全部出处', definition: '同一主体多来源/多行业时保留全部官方链接与行业；不是只显示最后一次来源' },
   ],
   intentions: [
     { key: 'published_date', label: '发布日期' },
@@ -2090,9 +2232,27 @@ export function ceaExportRows(dataset, filters = {}) {
       来源: '官方来源 URL 见 source_url 列',
     };
   } else if (dataset === 'entities') {
-    const out = listCeaEntities({ ...filters, limit: 1000 });
-    rows = out.rows;
-    meta = { 数据截至: rows[0]?.data_as_of || '（暂无名录数据）', 说明: '名录数量不等于买家数量' };
+    // 列表API仍保留分页上限；导出遍历完整筛选结果，避免静默丢掉第1001行之后的企业。
+    const collected = [];
+    let exportOffset = 0;
+    let expectedTotal = null;
+    let asOf = null;
+    while (expectedTotal === null || exportOffset < expectedTotal) {
+      const page = listCeaEntities({ ...filters, limit: 1000, offset: exportOffset });
+      if (expectedTotal === null) { expectedTotal = page.total; asOf = page.coverage?.as_of || null; }
+      collected.push(...page.rows);
+      exportOffset += page.rows.length;
+      if (!page.rows.length) break;
+    }
+    if (collected.length !== expectedTotal) return { error: '名录导出行数不完整，请重试', status: 503 };
+    rows = collected.map((r) => {
+      const memberships = Array.isArray(r.source_memberships) ? r.source_memberships : [];
+      const notes = memberships.length
+        ? memberships.map((m) => `${m.sector ? `${m.sector}：` : ''}${m.source_url || '（无链接）'}`).join('；')
+        : (r.source_url || null);
+      return { ...r, notes: [r.note, notes].filter(Boolean).join('；') };
+    });
+    meta = { 数据截至: asOf || '（暂无名录数据）', 说明: '名录数量不等于买家数量；备注保留原件说明与全部出处链接' };
   } else if (dataset === 'intentions') {
     const out = listCeaIntentions({ ...filters, limit: 1000 });
     rows = out.rows;

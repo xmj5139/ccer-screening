@@ -17,7 +17,8 @@
  *   - 不打印、不存储任何明文凭据。
  */
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { all, get, run, metaValue, setMeta, getDb, audit } from '../core/db.mjs';
@@ -1340,7 +1341,35 @@ export function sourceEntityMeta(source = {}) {
   const blob = `${source.name || ''} ${source.note || ''} ${source.authority || ''}`;
   const year = Number((blob.match(/(20\d{2})\s*年/) || [])[1] || 0) || null;
   const prov = (blob.match(/(北京|天津|河北|山西|内蒙古|辽宁|吉林|黑龙江|上海|江苏|浙江|安徽|福建|江西|山东|河南|湖北|湖南|广东|广西|海南|重庆|四川|贵州|云南|西藏|陕西|甘肃|青海|宁夏|新疆)(?:省|市|自治区)?/) || [])[1] || null;
-  return { list_year: year, province: prov, source: year || prov ? '来源登记信息' : null };
+  // 单一行业文件可由来源登记补充 sector；名称/说明同时出现多个行业时保持 null，
+  // 交给表标题或表内分节判断，不按第一个行业词猜测。
+  const sectors = [...new Set((blob.match(/发电|钢铁|水泥|铝冶炼/g) || []))];
+  const explicitSector = /^(发电|钢铁|水泥|铝冶炼)$/.test(String(source.sector || '')) ? source.sector : null;
+  const sector = explicitSector || (sectors.length === 1 ? sectors[0] : null);
+  return { list_year: year, province: prov, sector, source: year || prov || sector ? '来源登记信息' : null };
+}
+
+/**
+ * 默认名录来源轮换（docs/64 第 1 条）：
+ *   - 未尝试来源优先（last_attempt_at 为空）；
+ *   - 已尝试来源按 last_attempt_at 最旧优先；
+ *   - 再按 priority 升序、code 字典序稳定排序。
+ * 显式 codes 不走此函数：调用方按指定顺序处理，不擅自轮换。
+ */
+export function selectCeaEntitySourceBatch(sources = [], { limit = 4 } = {}) {
+  const max = Math.max(1, Number(limit) || 4);
+  const sorted = [...sources].sort((a, b) => {
+    const aAt = a?.last_attempt_at ? (Date.parse(a.last_attempt_at) || 0) : null;
+    const bAt = b?.last_attempt_at ? (Date.parse(b.last_attempt_at) || 0) : null;
+    if (aAt === null && bAt !== null) return -1;
+    if (aAt !== null && bAt === null) return 1;
+    if (aAt !== null && bAt !== null && aAt !== bAt) return aAt - bAt;
+    const aPri = Number.isFinite(Number(a?.priority)) ? Number(a.priority) : 100;
+    const bPri = Number.isFinite(Number(b?.priority)) ? Number(b.priority) : 100;
+    if (aPri !== bPri) return aPri - bPri;
+    return String(a?.code || '').localeCompare(String(b?.code || ''));
+  });
+  return { selected: sorted.slice(0, max), deferred: sorted.slice(max) };
 }
 
 /** 响应是否为 PDF（内容类型或文件头）——名录 PDF 不能被当 HTML 解析 */
@@ -1349,6 +1378,281 @@ export function isPdfResponse(fetched = {}) {
   if (ct.includes('application/pdf')) return true;
   const buf = fetched.buf;
   return !!(buf && Buffer.isBuffer(buf) && buf.subarray(0, 5).toString('latin1') === '%PDF-');
+}
+
+const MAX_ENTITY_DOCX_BYTES = 12 * 1024 * 1024;
+const MAX_ENTITY_DOCX_XML_BYTES = 8 * 1024 * 1024;
+const MAX_ENTITY_DOCX_TOTAL_BYTES = 32 * 1024 * 1024;
+const MAX_ENTITY_DOCX_OUTPUT_CHARS = 2_000_000;
+const MAX_ENTITY_PDF_WRAPPER_BYTES = 24 * 1024 * 1024;
+const MAX_ENTITY_PDF_PAYLOAD_BYTES = 20 * 1024 * 1024;
+
+/** 来源登记 kind / URL / content-type 明确指向 DOCX 时才按 DOCX 处理。 */
+export function isDocxSource(source = {}, fetched = {}) {
+  const kind = String(source.kind || '').toLowerCase();
+  const url = String(source.url || fetched.final_url || '');
+  const ct = String(fetched.content_type || '').toLowerCase();
+  return kind === 'official_docx' || /\.docx(?:$|[?#])/i.test(url)
+    || ct.includes('wordprocessingml.document');
+}
+
+function isPdfSource(source = {}) {
+  return String(source.kind || '').toLowerCase() === 'official_pdf' || /\.pdf(?:$|[?#])/i.test(String(source.url || ''));
+}
+
+function pythonDocxCandidates() {
+  if (process.env.CCER_PYTHON) return [process.env.CCER_PYTHON];
+  return process.platform === 'win32' ? ['python'] : ['python3', 'python'];
+}
+
+// 只依赖 Python 标准库；不读宏、不执行附件代码，也不解压 word/document.xml 之外的部件。
+const DOCX_EXTRACT_SCRIPT = String.raw`
+import io, sys, zipfile, html, xml.etree.ElementTree as ET
+in_path, out_path, err_path = sys.argv[1:4]
+max_input, max_xml, max_total, max_out = map(int, sys.argv[4:8])
+def fail(msg):
+    with open(err_path, 'w', encoding='utf-8') as f:
+        f.write(msg)
+    raise SystemExit(2)
+with open(in_path, 'rb') as f:
+    raw = f.read(max_input + 1)
+if len(raw) > max_input:
+    fail('docx exceeds input size limit')
+try:
+    z = zipfile.ZipFile(io.BytesIO(raw))
+except Exception as e:
+    fail('invalid zip: ' + str(e))
+infos = z.infolist()
+if not infos or len(infos) > 10000:
+    fail('invalid zip entry count')
+names = {i.filename for i in infos}
+if '[Content_Types].xml' not in names or 'word/document.xml' not in names:
+    fail('missing docx part')
+if any(n.startswith('/') or '..' in n.replace('\\', '/').split('/') for n in names):
+    fail('unsafe zip member path')
+if any(n.lower().endswith('vbaproject.bin') for n in names):
+    fail('macro-bearing document rejected')
+if any(i.flag_bits & 1 for i in infos):
+    fail('encrypted zip entry rejected')
+if sum(i.file_size for i in infos) > max_total:
+    fail('docx uncompressed total exceeds limit')
+doc = next(i for i in infos if i.filename == 'word/document.xml')
+if doc.file_size > max_xml:
+    fail('document.xml exceeds limit')
+try:
+    with z.open(doc) as f:
+        xml_bytes = f.read(max_xml + 1)
+except Exception as e:
+    fail('cannot read document.xml: ' + str(e))
+if len(xml_bytes) > max_xml:
+    fail('document.xml exceeds limit after decompression')
+# 拒绝 DTD/实体声明，避免实体膨胀；Word 正常文档不需要它们。
+if b'<!DOCTYPE' in xml_bytes or b'<!ENTITY' in xml_bytes:
+    fail('DTD/entity declarations rejected')
+try:
+    root = ET.fromstring(xml_bytes)
+except Exception as e:
+    fail('invalid document.xml: ' + str(e))
+W = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
+def text_of(node):
+    parts = []
+    for n in node.iter():
+        if n.tag == W + 't':
+            parts.append(n.text or '')
+        elif n.tag in (W + 'tab',):
+            parts.append('\t')
+        elif n.tag in (W + 'br', W + 'cr'):
+            parts.append('\n')
+    return ''.join(parts)
+def blocks(node):
+    for child in list(node):
+        if child.tag == W + 'p':
+            yield child
+        elif child.tag == W + 'tbl':
+            yield child
+        elif child.tag in (W + 'sdt', W + 'sdtContent'):
+            yield from blocks(child)
+out = []
+size = 0
+def emit(piece):
+    global size
+    if size > max_out:
+        fail('docx html output exceeds limit')
+    out.append(piece)
+    size += len(piece)
+body = root.find(W + 'body')
+if body is None:
+    fail('missing document body')
+for block in blocks(body):
+    if block.tag == W + 'p':
+        emit('<p>' + html.escape(text_of(block)) + '</p>')
+    else:
+        rows = []
+        for tr in block.findall(W + 'tr'):
+            cells = []
+            for tc in tr.findall(W + 'tc'):
+                cells.append('<td>' + html.escape(text_of(tc)) + '</td>')
+            rows.append('<tr>' + ''.join(cells) + '</tr>')
+        emit('<table>' + ''.join(rows) + '</table>')
+if size > max_out:
+    fail('docx html output exceeds limit')
+with open(out_path, 'w', encoding='utf-8') as f:
+    f.write('<!doctype html><html><head><meta charset="utf-8"></head><body>' + ''.join(out) + '</body></html>')
+`;
+
+/**
+ * 有界 DOCX → 转义 HTML。只读 word/document.xml；失败时返回原因而不是把二进制当 HTML。
+ * @returns {{ok:boolean, html?:string, reason?:string, message?:string, bytes?:number, xml_bytes?:number}}
+ */
+export function extractDocxEntityHtml(buf, {
+  deadlineAt = null,
+  maxBytes = MAX_ENTITY_DOCX_BYTES,
+  maxXmlBytes = MAX_ENTITY_DOCX_XML_BYTES,
+  maxTotalBytes = MAX_ENTITY_DOCX_TOTAL_BYTES,
+  maxOutputChars = MAX_ENTITY_DOCX_OUTPUT_CHARS,
+  timeoutMs = 15000,
+} = {}) {
+  if (!Buffer.isBuffer(buf) || !buf.length) return { ok: false, reason: 'empty_docx', message: 'DOCX 响应为空' };
+  if (buf.length > maxBytes) return { ok: false, reason: 'docx_too_large', message: `DOCX 原件超过 ${maxBytes} 字节上限` };
+  const hasDeadline = deadlineAt !== null && deadlineAt !== undefined && Number.isFinite(Number(deadlineAt));
+  const remaining = hasDeadline ? Number(deadlineAt) - Date.now() : null;
+  if (remaining !== null && remaining <= 1000) {
+    return { ok: false, reason: 'deadline_exceeded', message: '批次总时间上限已到：DOCX 未开始解包（留待下一批）' };
+  }
+  const limitMs = remaining === null ? timeoutMs : Math.max(1000, Math.min(timeoutMs, remaining - 100));
+  let lastError = null;
+  // 受限环境禁止 Node 用管道捕获子进程输出（EPERM），且大 XML 也不适合走 maxBuffer。
+  // 因此输入/HTML/错误都走临时文件，子进程 stdio 全忽略；结束即删除临时目录。
+  const dir = mkdtempSync(join(tmpdir(), 'cea-docx-'));
+  const inputPath = join(dir, 'input.docx');
+  const outputPath = join(dir, 'output.html');
+  const errorPath = join(dir, 'error.txt');
+  try {
+    writeFileSync(inputPath, buf);
+    for (const cmd of pythonDocxCandidates()) {
+      const r = spawnSync(cmd, [
+        '-c', DOCX_EXTRACT_SCRIPT, inputPath, outputPath, errorPath,
+        String(maxBytes), String(maxXmlBytes), String(maxTotalBytes), String(maxOutputChars),
+      ], {
+        timeout: limitMs,
+        windowsHide: true,
+        stdio: 'ignore',
+        env: { ...process.env, PYTHONIOENCODING: 'utf-8' },
+      });
+      if (r.error?.code === 'ENOENT') { lastError = `未找到 Python 解释器（${cmd}）`; continue; }
+      if (r.error) {
+        if (r.error.code === 'ETIMEDOUT' || r.signal) {
+          return { ok: false, reason: 'docx_timeout', message: `DOCX 解包超过 ${limitMs}ms 时限` };
+        }
+        return { ok: false, reason: 'python_failed', message: r.error.message };
+      }
+      if (r.status !== 0) {
+        let msg = '';
+        try { msg = String(readFileSync(errorPath, 'utf8') || '').trim().slice(0, 500); } catch { /* ignore */ }
+        return { ok: false, reason: 'invalid_docx', message: msg || `Python 解包退出码 ${r.status}` };
+      }
+      let html = '';
+      try { html = String(readFileSync(outputPath, 'utf8') || ''); } catch { /* ignore */ }
+      if (!html) return { ok: false, reason: 'empty_docx_html', message: 'DOCX 未产出可解析 HTML' };
+      return { ok: true, html, bytes: buf.length, xml_bytes: null };
+    }
+  } finally {
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+  return { ok: false, reason: 'python_unavailable', message: lastError || '未找到可用的 Python 解释器' };
+}
+
+function multipartBoundary(buf, contentType) {
+  const ct = String(contentType || '');
+  const fromHeader = ct.match(/boundary=(?:"([^"]+)"|([^;\s]+))/i);
+  let boundary = fromHeader ? (fromHeader[1] || fromHeader[2]) : null;
+  if (!boundary) {
+    const firstEnd = buf.indexOf('\r\n');
+    if (firstEnd > 2) {
+      const first = buf.subarray(0, firstEnd).toString('latin1');
+      if (first.startsWith('--')) boundary = first.slice(2);
+    }
+  }
+  if (!boundary || boundary.length > 70 || /[\r\n]/.test(boundary)) return null;
+  return boundary;
+}
+
+/**
+ * 解码「单个完整 PDF 附件」的 multipart/form-data 外壳。
+ * 只接受恰好一个、边界完整、以 %PDF- 开头并以 %%EOF 结束的 PDF 部件；
+ * 异常/多附件/超限一律失败。原始 HTTP 字节与解码载荷的哈希分别返回，不混用。
+ */
+export function unwrapCeaMultipartPdf(fetched = {}, {
+  maxBytes = MAX_ENTITY_PDF_WRAPPER_BYTES, maxPayloadBytes = MAX_ENTITY_PDF_PAYLOAD_BYTES,
+} = {}) {
+  const buf = fetched.buf;
+  if (!Buffer.isBuffer(buf) || !buf.length) return { ok: false, reason: 'empty_wrapper', message: '响应为空' };
+  if (buf.length > maxBytes) return { ok: false, reason: 'wrapper_too_large', message: `multipart 外壳超过 ${maxBytes} 字节上限` };
+  const ct = String(fetched.content_type || '');
+  const boundary = multipartBoundary(buf, ct);
+  if (!boundary) return { ok: false, reason: 'multipart_boundary_missing', message: '响应没有可确认的 multipart 边界' };
+  const marker = Buffer.from(`--${boundary}`, 'latin1');
+  if (buf.indexOf(marker) !== 0) {
+    return { ok: false, reason: 'multipart_boundary_missing', message: 'multipart 边界不在响应开头，拒绝猜测' };
+  }
+  let pos = marker.length;
+  if (buf.subarray(pos, pos + 2).toString('latin1') !== '\r\n') {
+    return { ok: false, reason: 'multipart_incomplete', message: 'multipart 起始边界后缺少 CRLF' };
+  }
+  pos += 2;
+  const parts = [];
+  while (true) {
+    const headEnd = buf.indexOf('\r\n\r\n', pos);
+    if (headEnd < 0 || headEnd - pos > 8192) {
+      return { ok: false, reason: 'multipart_bad_headers', message: 'multipart 部件头缺失或过长' };
+    }
+    const headersText = buf.subarray(pos, headEnd).toString('latin1');
+    const next = buf.indexOf(Buffer.from(`\r\n--${boundary}`, 'latin1'), headEnd + 4);
+    if (next < 0) return { ok: false, reason: 'multipart_incomplete', message: 'multipart 部件未闭合（可能是截断响应）' };
+    // 独立提取的真实样本保留了边界前的 CRLF；为与证据文件/载荷哈希一致，
+    // 这里也把该 CRLF 计入 PDF 载荷（PDF 解析会忽略尾随空白）。
+    const payload = buf.subarray(headEnd + 4, next + 2);
+    parts.push({ headersText, payload });
+    if (parts.length > 1) {
+      return { ok: false, reason: 'multipart_multiple_parts', message: 'multipart 包含多个附件，拒绝自动挑选' };
+    }
+    pos = next + 2 + marker.length;
+    const after = buf.subarray(pos, pos + 2).toString('latin1');
+    if (after === '--') {
+      pos += 2;
+      const rest = buf.subarray(pos).toString('latin1').replace(/[\r\n]/g, '');
+      if (rest) return { ok: false, reason: 'multipart_trailing_data', message: 'multipart 结束边界后仍有多余数据' };
+      break;
+    }
+    if (after === '\r\n') { pos += 2; continue; }
+    return { ok: false, reason: 'multipart_incomplete', message: 'multipart 边界格式异常' };
+  }
+  if (parts.length !== 1) return { ok: false, reason: 'multipart_multiple_parts', message: 'multipart 必须恰好包含一个附件' };
+  const part = parts[0];
+  const transferEncoding = (part.headersText.match(/content-transfer-encoding:\s*([^\r\n;]+)/i) || [])[1]?.trim().toLowerCase();
+  if (transferEncoding && !['binary', '8bit', '7bit'].includes(transferEncoding)) {
+    return { ok: false, reason: 'multipart_encoding_unsupported', message: '附件传输编码不是 binary/8bit，拒绝猜测解码' };
+  }
+  const filename = (part.headersText.match(/filename="?([^";\r\n]+)"?/i) || [])[1] || null;
+  const partType = (part.headersText.match(/content-type:\s*([^;\r\n]+)/i) || [])[1] || '';
+  if (!/%PDF-/i.test(part.payload.subarray(0, 8).toString('latin1'))) {
+    return { ok: false, reason: 'multipart_not_pdf', message: '唯一附件不是 PDF（缺少 %PDF- 文件头）' };
+  }
+  if (!filename || !/\.pdf$/i.test(filename)) {
+    if (!/application\/pdf/i.test(partType)) return { ok: false, reason: 'multipart_not_pdf', message: '唯一附件没有 .pdf 文件名或 PDF 类型' };
+  }
+  if (part.payload.length > maxPayloadBytes) {
+    return { ok: false, reason: 'pdf_payload_too_large', message: `PDF 载荷超过 ${maxPayloadBytes} 字节上限` };
+  }
+  if (!part.payload.subarray(Math.max(0, part.payload.length - 2048)).toString('latin1').trimEnd().endsWith('%%EOF')) {
+    return { ok: false, reason: 'pdf_incomplete', message: 'PDF 载荷缺少 %%EOF 结束标记' };
+  }
+  const payload = Buffer.from(part.payload);
+  return {
+    ok: true, kind: 'pdf', buf: payload, transport: 'multipart',
+    hash: sha256(payload), raw_hash: fetched.hash || null, filename,
+    payload_bytes: payload.length, content_type: partType || null,
+  };
 }
 
 /**
@@ -1363,12 +1667,25 @@ export function isPdfResponse(fetched = {}) {
 export async function collectCeaEntities({ actor = 'system:cea-collect', codes = null, listYear = null, province = null, trigger = 'manual', cfg = ceaCollectConfig(), deadlineAt = null } = {}) {
   const guard = preflight(cfg, '采集 CEA 名录');
   if (guard) return guard;
-  const list = (codes && codes.length)
+  const explicit = Array.isArray(codes) && codes.length > 0;
+  const unknownCodes = explicit
+    ? codes.filter((c) => !getCeaSourceByCode(c))
+    : [];
+  const list = explicit
     ? codes.map((c) => getCeaSourceByCode(c)).filter(Boolean)
-    : all("SELECT code FROM cea_source WHERE enabled=1 AND dataset='entity' ORDER BY priority").map((r) => getCeaSourceByCode(r.code));
+    : all("SELECT code FROM cea_source WHERE enabled=1 AND dataset='entity' ORDER BY priority, code").map((r) => getCeaSourceByCode(r.code));
   if (!list.length) {
-    return { ok: false, reason: 'no_entity_source', message: '未登记可用的省级名录来源', entities: 0 };
+    return {
+      ok: false, reason: 'no_entity_source', message: '未登记可用的省级名录来源', entities: 0,
+      unknown_codes: unknownCodes, sources_total: 0, sources_attempted: 0, sources_not_attempted: 0,
+    };
   }
+  // 每批最多 4 个来源；默认轮换，显式 codes 严格按给定顺序（不轮换）。
+  const batch = explicit
+    ? { selected: list.slice(0, 4), deferred: list.slice(4) }
+    : selectCeaEntitySourceBatch(list, { limit: 4 });
+  const selected = batch.selected;
+  const selection = explicit ? 'explicit' : 'rotation';
   const budget = Math.max(5000, Number(cfg.batch_budget_ms) || CEA_DEFAULTS.batch_budget_ms);
   const started = Date.now();
   // 共享 deadline：名录通道同样不单独重置批次预算
@@ -1377,12 +1694,27 @@ export async function collectCeaEntities({ actor = 'system:cea-collect', codes =
   if (job.reused) {
     return ceaReentryResult(job, 'CEA 名录采集任务');
   }
+  const attemptedCodes = new Set();
   const out = {
     job_id: job.id, sources: [], entities_created: 0, entities_updated: 0, failed: [],
-    parse_gaps: [], truncated: false, pdf_sources: 0, rows_parsed: 0,
+    parse_gaps: [], truncated: batch.deferred.length > 0, pdf_sources: 0, rows_parsed: 0,
+    unchanged: 0,
+    selection, batch_limit: 4,
+    sources_total: list.length,
+    sources_selected: selected.length,
+    sources_attempted: 0,
+    sources_not_attempted: list.length,
+    unknown_codes: unknownCodes,
   };
-  for (const s of list.slice(0, 4)) {
-    if (Date.now() > deadline) { out.truncated = true; break; }
+  for (const s of selected) {
+    if (Date.now() > deadline) {
+      out.truncated = true;
+      out.deadline_exceeded = true;
+      out.unattempted_sources = selected.filter((x) => !attemptedCodes.has(x.code)).map((x) => x.code);
+      break;
+    }
+    attemptedCodes.add(s.code);
+    out.sources_attempted = attemptedCodes.size;
     const fetched = await fetchAndSnapshot(s.url, {
       allowedDomains: s.allowed_domains, sourceId: s.id, timeoutMs: cfg.request_timeout_ms, actor, deadlineAt: deadline,
       parserNote: `CEA 名录来源：${s.code}`,
@@ -1405,29 +1737,117 @@ export async function collectCeaEntities({ actor = 'system:cea-collect', codes =
 
     // 省份/年度：优先取**原文**，其次取来源登记信息；都没有就留 NULL（不猜测）
     const meta = sourceEntityMeta(s);
-    const pdf = isPdfResponse(fetched);
+    const wantsDocx = isDocxSource(s, fetched);
+    const wantsPdf = isPdfSource(s);
+    const rawPdf = !wantsDocx && isPdfResponse(fetched);
+    // 山西等站点把 PDF 包在 multipart/form-data 外壳里：先解码出唯一完整 PDF 载荷，
+    // 原始 HTTP 哈希仍用于快照/缓存 identity，载荷哈希只随解析详情保存。
+    const pdfEnvelope = !wantsDocx && !rawPdf && wantsPdf ? unwrapCeaMultipartPdf(fetched) : null;
+    const envelopeError = pdfEnvelope && !pdfEnvelope.ok ? pdfEnvelope : null;
+    const pdf = rawPdf || !!pdfEnvelope?.ok;
+    const pdfPayload = rawPdf
+      ? { buf: fetched.buf, hash: fetched.hash || sha256(fetched.buf || Buffer.alloc(0)), transport: 'raw', filename: null }
+      : (pdfEnvelope?.ok ? pdfEnvelope : null);
     const accepted = uj(metaValue(`cea_entity_parse_result:${s.code}`, null), null);
-    if (accepted?.complete && accepted.hash === fetched.hash) {
-      const savedCount = get('SELECT COUNT(*) AS n FROM cea_entity WHERE source_code=? AND source_hash=?', [s.code, fetched.hash])?.n || 0;
-      if (savedCount === accepted.rows && savedCount > 0) {
+    // 上次解析失败留下的 open gap 表示「该来源尚未完成」；即使旧缓存 hash 相同，
+    // 也要重新解析并尝试结清缺口，不能靠旧缓存宣称本轮已恢复。
+    const openParseGap = get(
+      "SELECT id FROM data_gap WHERE dataset='cea_entity' AND status='open' AND gap_key=?",
+      [`cea:entity:parse:${s.code}`]
+    );
+    if (accepted?.complete && accepted.hash === fetched.hash && !openParseGap) {
+      // 缓存命中按本来源的**成员关系去重企业**计数，不能看 cea_entity 最后一次 source_code：
+      // 同一主体同时出现在多个来源时，主体行的 source_code/source_hash 会被后一个来源覆盖。
+      const savedCount = get(
+        `SELECT COUNT(DISTINCT m.entity_id) AS n
+           FROM cea_entity_membership m
+           JOIN cea_entity e ON e.id = m.entity_id
+          WHERE m.source_code=? AND m.source_hash=?`,
+        [s.code, fetched.hash]
+      )?.n || 0;
+      const expectedEntities = Number(accepted.entities) || Number(accepted.rows) || 0;
+      if (savedCount === expectedEntities && savedCount > 0) {
         out.rows_parsed += savedCount;
         out.unchanged = (out.unchanged || 0) + savedCount;
         out.sources.push({ source: s.code, rows: savedCount, created: 0, updated: 0, unchanged: true, parser: accepted.parser });
         markCeaSourceRun(s.code, { ok: true, itemsOk: savedCount });
-        addCeaStep(job.id, { stage: 'parse', target: s.url, status: 'ok', items: savedCount, message: '官方文件哈希未变，复用已完成的逐页结构化结果；不以较弱解析覆盖既有字段', snapshotId: fetched.snapshotId });
+        closeCeaGapsByPrefixes([`cea:entity:fetch:${s.code}`, `cea:entity:parse:${s.code}`], {
+          note: `官方原件 hash 未变，复用 ${savedCount} 行已完成结构化结果`, actor,
+        });
+        addCeaStep(job.id, { stage: 'parse', target: s.url, status: 'ok', items: savedCount, message: '官方文件哈希未变，复用已完成的结构化结果；不以较弱解析覆盖既有字段', snapshotId: fetched.snapshotId });
         continue;
       }
     }
     let parseSource = fetched.body;
     let parseKind = 'html';
     let parseDetail = null;
-    if (pdf) {
+    if (wantsDocx) {
+      // DOCX 是 ZIP 容器，绝不能按 UTF-8 字符串走 HTML 解析。只在内存中解包
+      // word/document.xml；失败如实留 parse gap，不输出半份名录。
+      const docx = extractDocxEntityHtml(fetched.buf, { deadlineAt: deadline });
+      if (!docx.ok) {
+        const gap = recordCeaGap({
+          dataset: CEA_GAP_DATASETS.entity,
+          title: `CEA 名录 DOCX 无法安全解包：${s.name}`,
+          description:
+            `${s.url} 已真实抓取（快照 ${fetched.snapshotId}，${fetched.bytes} 字节，sha256 ${String(fetched.hash).slice(0, 16)}…），` +
+            `但 DOCX 解包失败（${docx.reason}：${docx.message || ''}）。` +
+            '仅读取 word/document.xml，不执行宏/附件代码；本来源未写入任何名录行。',
+          impact: '该省名录覆盖数为 0；parse gap 如实保留，不把二进制或半份表格当名录。',
+          severity: 'warning',
+          manualPath: '可核对官方 DOCX 是否损坏/改版，或由管理员上传可读副本。',
+          gapKey: `cea:entity:parse:${s.code}`,
+        });
+        out.parse_gaps.push({
+          source: s.code, reason: docx.reason, message: docx.message || null,
+          gap_id: gap.id, kind: 'docx',
+        });
+        addCeaStep(job.id, {
+          stage: 'parse', target: s.url, status: 'failed', items: 0,
+          message: `DOCX 解包失败（${docx.reason}），保留 parse gap，未写入任何行`,
+          snapshotId: fetched.snapshotId,
+        });
+        markCeaSourceRun(s.code, { ok: false, error: `docx:${docx.reason}`, itemsFailed: 1 });
+        continue;
+      }
+      parseKind = 'docx';
+      parseSource = docx.html;
+      parseDetail = {
+        transport: 'docx', bytes: docx.bytes, original_http_sha256: fetched.hash,
+        parser_version: 'docx-zip-xml-v1',
+      };
+    } else if (envelopeError) {
+      // 来源明确是 PDF，但响应既不是裸 PDF，也不是边界完整的单个 PDF 附件。
+      const gap = recordCeaGap({
+        dataset: CEA_GAP_DATASETS.entity,
+        title: `CEA 名录 PDF 外壳无法安全解码：${s.name}`,
+        description:
+          `${s.url} 已真实抓取（快照 ${fetched.snapshotId}，${fetched.bytes} 字节，原始 HTTP sha256 ${String(fetched.hash).slice(0, 16)}…），` +
+          `但响应不是可确认的单个完整 PDF 附件（${envelopeError.reason}：${envelopeError.message || ''}）。` +
+          '异常、多附件或超限一律拒绝，不猜选其中一个。',
+        impact: '该省名录覆盖数为 0；原始响应哈希保留，解析载荷未写入。',
+        severity: 'warning',
+        manualPath: '可核对官方返回的 multipart 结构，或由管理员上传单独的官方 PDF。',
+        gapKey: `cea:entity:parse:${s.code}`,
+      });
+      out.parse_gaps.push({
+        source: s.code, reason: envelopeError.reason, message: envelopeError.message || null,
+        gap_id: gap.id, kind: 'pdf_wrapper',
+      });
+      addCeaStep(job.id, {
+        stage: 'parse', target: s.url, status: 'failed', items: 0,
+        message: `PDF 外壳解码失败（${envelopeError.reason}），保留 parse gap，未写入任何行`,
+        snapshotId: fetched.snapshotId,
+      });
+      markCeaSourceRun(s.code, { ok: false, error: `pdf_wrapper:${envelopeError.reason}`, itemsFailed: 1 });
+      continue;
+    } else if (pdf) {
       out.pdf_sources += 1;
       parseKind = 'pdf';
-      // 二进制绝不进 HTML 解析：先落盘原件，再用统一异步服务逐页解析（缺文字/乱码页走 OCR）
+      // 二进制绝不进 HTML 解析：先落盘 PDF 载荷（multipart 外壳只保存原始快照），再逐页解析。
       let saved = null;
       try {
-        saved = saveCeaAttachment(s.code, fetched.buf || fetched.body, { actor });
+        saved = saveCeaAttachment(s.code, pdfPayload.buf, { actor });
       } catch (e) {
         saved = { error: e.message };
       }
@@ -1445,7 +1865,7 @@ export async function collectCeaEntities({ actor = 'system:cea-collect', codes =
         continue;
       }
       const parsed = await parsePdfDocument({
-        filePath: saved.path, sha256: saved.hash || fetched.hash,
+        filePath: saved.path, sha256: pdfPayload.hash,
         deadlineAt: deadline, maxPages: Number(cfg.ocr_max_pages_per_doc) || 50,
       });
       parseDetail = {
@@ -1453,7 +1873,9 @@ export async function collectCeaEntities({ actor = 'system:cea-collect', codes =
         pages_total: parsed.pages_total, pages_text: parsed.pages_text,
         pages_ocr: parsed.pages_ocr, pages_failed: parsed.pages_failed,
         failed_pages: parsed.failed_pages || [], aborted: parsed.aborted || null,
-        local_path: saved.path, hash: saved.hash || fetched.hash,
+        local_path: saved.path, hash: saved.hash || pdfPayload.hash,
+        transport: pdfPayload.transport, original_http_sha256: fetched.hash,
+        payload_sha256: pdfPayload.hash, payload_bytes: pdfPayload.payload_bytes || saved.bytes || null,
       };
       if (!parsed.raw_text && !parsed.text) {
         const gap = recordCeaGap({
@@ -1487,6 +1909,9 @@ export async function collectCeaEntities({ actor = 'system:cea-collect', codes =
     const rows = parseEntityRows(parseSource, {
       listYear: meta.list_year || listYear,
       province: meta.province || null,
+      // 文件单一行业（如四川水泥/铝冶炼）允许来源登记 sector 补充；
+      // 多行业来源保持 null，由表标题/分节决定。
+      sector: meta.sector || null,
     });
     let created = 0;
     let updated = 0;
@@ -1494,17 +1919,52 @@ export async function collectCeaEntities({ actor = 'system:cea-collect', codes =
     for (const r of rows) {
       // 名称必须在原文出现（parseEntityRows 已保证）；年度必须来自原文或来源登记
       if (!Number.isInteger(Number(r.list_year))) { skippedNoYear += 1; continue; }
-      const res = upsertCeaEntity(
-        {
-          ...r,
-          list_year: Number(r.list_year),
-          province: r.province || null,
-          source_code: s.code, source_url: s.url, snapshot_id: fetched.snapshotId,
-          source_hash: fetched.hash, data_as_of: todayCst(),
-        },
-        { actor }
-      );
+      const listYear = Number(r.list_year);
+      const patch = {
+        ...r,
+        list_year: listYear,
+        province: r.province || null,
+        source_code: s.code, source_url: s.url, snapshot_id: fetched.snapshotId,
+        source_hash: fetched.hash, data_as_of: todayCst(),
+      };
+      // 同一原件 hash 未变时复用缓存；若缓存因行数不一致而重解析，
+      // 也不允许弱解析抹掉既有完整字段（代码/地区/行业/更完整名称）。
+      let existing = get('SELECT * FROM cea_entity WHERE entity_key=? AND list_year=?', [r.credit_code || `name:${r.name}`, listYear]);
+      if (!existing && !r.credit_code) {
+        existing = get('SELECT * FROM cea_entity WHERE name=? AND list_year=? AND source_code=?', [r.name, listYear, s.code]);
+      }
+      if (existing) {
+        if (!patch.credit_code && existing.credit_code) patch.credit_code = existing.credit_code;
+        if (!patch.city && existing.city) patch.city = existing.city;
+        // 有来源的采集不把主体聚合行业当作本行行业回填：成员关系按行行业拆分保存，
+        // 主体聚合行业由 upsertCeaEntity 按全部成员关系合并。
+        if (!patch.province && existing.province) patch.province = existing.province;
+        if (existing.source_hash && patch.source_hash === existing.source_hash
+          && existing.name && patch.name && patch.name.length < existing.name.length) {
+          patch.name = existing.name;
+        }
+      }
+      const res = upsertCeaEntity(patch, { actor });
       if (res.created) created += 1; else if (res.updated) updated += 1;
+    }
+    if (rows.length > 0) {
+      // 既有 cache 契约：完整解析结果按 source code + 原件 hash 复用；
+      // 记录真实行数，不以 0 行或弱解析覆盖已完成结构。
+      setMeta(getDb(), `cea_entity_parse_result:${s.code}`, j({
+        hash: fetched.hash,
+        rows: rows.length,
+        // 同一主体跨行业/跨表出现时 rows 会合并；缓存命中必须按去重企业数核对。
+        entities: rows.length,
+        complete: true,
+        parser: `entity-directory-v2:${parseKind}`,
+        source_snapshot_id: fetched.snapshotId,
+        source_url: s.url,
+        at: nowIso(),
+      }));
+      // 原件已实际取得并解析出主体：结清对应的抓取/解析缺口（记录保留）。
+      closeCeaGapsByPrefixes([`cea:entity:fetch:${s.code}`, `cea:entity:parse:${s.code}`], {
+        note: `已从 ${s.url} 解析并写入 ${rows.length} 行`, actor,
+      });
     }
     out.entities_created += created;
     out.entities_updated += updated;
@@ -1524,7 +1984,7 @@ export async function collectCeaEntities({ actor = 'system:cea-collect', codes =
         dataset: CEA_GAP_DATASETS.entity,
         title: `CEA 名录原件已获取但未解析出主体行：${s.name}`,
         description:
-          `已真实抓取（快照 ${fetched.snapshotId}，${fetched.bytes} 字节，按 ${parseKind === 'pdf' ? 'PDF 解析' : 'HTML 解析'}），` +
+          `已真实抓取（快照 ${fetched.snapshotId}，${fetched.bytes} 字节，按 ${parseKind === 'pdf' ? 'PDF 解析' : parseKind === 'docx' ? 'DOCX 解包解析' : 'HTML 解析'}），` +
           `但未识别出可核对的企业行（未披露统一社会信用代码、表格结构变化，或未出现名录年度/行业信息）。` +
           '未写入任何推测行，parse gap 如实保留。',
         impact: '该省覆盖数为 0；不凭猜测填主体。',
@@ -1537,24 +1997,38 @@ export async function collectCeaEntities({ actor = 'system:cea-collect', codes =
     markCeaSourceRun(s.code, { ok: rows.length > 0, itemsOk: rows.length, itemsFailed: rows.length ? 0 : 1 });
     addCeaStep(job.id, {
       stage: 'parse', target: s.url, status: rows.length ? 'ok' : 'failed', items: rows.length,
-      message: `${parseKind === 'pdf' ? 'PDF 解析' : 'HTML 解析'}：解析出 ${rows.length} 行（新建 ${created}，更新 ${updated}${skippedNoYear ? `，${skippedNoYear} 行缺年度未入库` : ''}）` +
+      message: `${parseKind === 'pdf' ? 'PDF 解析' : parseKind === 'docx' ? 'DOCX 解包解析' : 'HTML 解析'}：解析出 ${rows.length} 行（新建 ${created}，更新 ${updated}${skippedNoYear ? `，${skippedNoYear} 行缺年度未入库` : ''}）` +
         (rows.length ? '' : '；保留 parse gap，未写入任何行'),
       snapshotId: fetched.snapshotId,
     });
   }
   out.elapsed_ms = Date.now() - started;
+  out.sources_attempted = attemptedCodes.size;
+  out.deferred_sources = list.filter((s) => !attemptedCodes.has(s.code)).map((s) => s.code);
+  out.sources_not_attempted = out.deferred_sources.length;
+  out.truncated = out.truncated || out.sources_not_attempted > 0;
   // 【关键修正】任务状态只看**真实入库行数**：抓取成功但 0 行只能是 partial/failed，绝不 success
   const written = out.entities_created + out.entities_updated;
-  const jobStatus = written > 0
+  const unchanged = out.unchanged || 0;
+  // 缓存命中（hash 未变、复用已完成结构）也是真实完成，不因 published=0 误判 failed。
+  const settled = written + unchanged;
+  const jobStatus = settled > 0
     ? (out.parse_gaps.length || out.failed.length || out.truncated ? 'partial' : 'success')
     : 'failed';
   out.status = jobStatus;
   out.note = written > 0
-    ? `写入 ${written} 个主体${out.parse_gaps.length ? `；${out.parse_gaps.length} 个来源保留 parse gap（0 行）` : ''}${out.failed.length ? `；${out.failed.length} 个来源抓取失败` : ''}`
-    : `未写入任何主体：${out.failed.length} 个来源抓取失败、${out.parse_gaps.length} 个来源解析出 0 行（parse gap 已保留，任务状态为 ${jobStatus}）`;
+    ? `写入 ${written} 个主体${unchanged ? `；另有 ${unchanged} 行因原件 hash 未变复用已完成结构` : ''}${out.parse_gaps.length ? `；${out.parse_gaps.length} 个来源保留 parse gap（0 行）` : ''}${out.failed.length ? `；${out.failed.length} 个来源抓取失败` : ''}`
+    : unchanged > 0
+      ? `原件 hash 未变，复用 ${unchanged} 行已完成结构化结果（未重复写入）${out.parse_gaps.length ? `；${out.parse_gaps.length} 个来源保留 parse gap` : ''}${out.failed.length ? `；${out.failed.length} 个来源抓取失败` : ''}`
+      : `未写入任何主体：${out.failed.length} 个来源抓取失败、${out.parse_gaps.length} 个来源解析出 0 行（parse gap 已保留，任务状态为 ${jobStatus}）`;
+  if (out.sources_not_attempted > 0 || out.truncated) {
+    // 如实标记：本批最多 4 个来源，未尝试的来源留待下一批，不能宣称已完成。
+    out.note += `；本批按${selection === 'explicit' ? '显式 codes 顺序' : '默认轮换'}选择 ${selected.length}/${list.length} 个来源，` +
+      `实际尝试 ${out.sources_attempted} 个，${out.sources_not_attempted} 个未在本批处理（不表示已完成，留待下一批）`;
+  }
   closeCeaJob(job.id, {
     status: jobStatus,
-    found: list.length, parsed: out.rows_parsed, published: written,
+    found: out.sources_selected, parsed: out.rows_parsed, published: written,
     errors: out.failed.length + out.parse_gaps.length,
     errorSummary: (out.failed.length || out.parse_gaps.length)
       ? [

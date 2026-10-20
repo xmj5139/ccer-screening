@@ -266,6 +266,28 @@ CREATE INDEX IF NOT EXISTS idx_cea_entity_prov ON cea_entity(province, list_year
 CREATE INDEX IF NOT EXISTS idx_cea_entity_sector ON cea_entity(sector, list_year);
 CREATE INDEX IF NOT EXISTS idx_cea_entity_cc ON cea_entity(credit_code);
 
+-- 同一主体可在多个来源/行业名单中出现。成员关系/出处必须独立保存：
+-- 主体（cea_entity）仍按信用代码+年度去重，sector 只是聚合展示；行业筛选按本表命中。
+CREATE TABLE IF NOT EXISTS cea_entity_membership (
+  id            TEXT PRIMARY KEY,
+  entity_id     TEXT NOT NULL REFERENCES cea_entity(id) ON DELETE CASCADE,
+  source_code   TEXT NOT NULL,
+  sector        TEXT,
+  source_url    TEXT,
+  source_hash   TEXT,
+  snapshot_id   TEXT,
+  note          TEXT,
+  created_at    TEXT NOT NULL,
+  updated_at    TEXT NOT NULL
+);
+-- 同源同行业重采幂等；sector 为 NULL 时也要唯一。
+CREATE UNIQUE INDEX IF NOT EXISTS uq_cea_entity_membership
+  ON cea_entity_membership(entity_id, source_code, COALESCE(sector, ''));
+CREATE INDEX IF NOT EXISTS idx_cea_entity_mem_source
+  ON cea_entity_membership(source_code, source_hash);
+CREATE INDEX IF NOT EXISTS idx_cea_entity_mem_sector
+  ON cea_entity_membership(sector, source_code);
+
 -- 名录版本留痕：同一主体同一年的名称/行业变化保留历史，不静默改写
 CREATE TABLE IF NOT EXISTS cea_entity_revision (
   id            TEXT PRIMARY KEY,

@@ -838,78 +838,788 @@ function structuredEntityCells(text) {
   return records;
 }
 
+/* ------------------------------------------------------------------ */
+/*  名录年度识别：只认「名录/名单」标题附近的年度，不拿发布日期/引用年度  */
+/* ------------------------------------------------------------------ */
+
+const LIST_MARKER_RE = /重点排放单位(?:名录|名单)|温室气体重点排放单位|纳入碳市场重点排放单位名录|碳排放单位名录/;
+const ENTITY_NAV_RE = /^\s*(?:上一条|下一条|上一篇|下一篇|相关阅读|相关链接|往期|历史)/;
+const ENTITY_OUT_OF_SCOPE_RE = /地方试点|试点碳市场|碳排放权交易试点|仅报告|报告与核查|核查工作范围|拟纳入|征求意见|意见稿|采购公告|招标公告|中标公告|成交公告|比选公告|询价公告|采购项目/;
+const ENTITY_SECTOR_WORDS = ['发电', '钢铁', '水泥', '铝冶炼'];
+const CREDIT_TOKEN_ONE_RE = /[0-9A-Z]{15,20}/;
+// 旧兜底路径的 18 位校验字符集：排除 I/O/S/V/Z
+const LEGACY_CC_RE = /\b([0-9A-HJ-NPQRTUWXY]{18})\b/;
+
+function entityLines(text) {
+  return String(text || '')
+    .replace(/\r\n?/g, '\n')
+    .split('\n')
+    .map((line) => line.replace(/[\u00a0\u3000]/g, ' ').trim())
+    .filter(Boolean);
+}
+
+/** 标题区（用于省份/负面范围判断），不扫描正文中的历史名录链接 */
+function entityTitleContext(text) {
+  return entityLines(text).slice(0, 25).join(' ');
+}
+
+function entityProvince(text) {
+  const s = entityTitleContext(text);
+  const m = s.match(/(北京|天津|河北|山西|内蒙古|辽宁|吉林|黑龙江|上海|江苏|浙江|安徽|福建|江西|山东|河南|湖北|湖南|广东|广西|海南|重庆|四川|贵州|云南|西藏|陕西|甘肃|青海|宁夏|新疆)(?:省|市|自治区|壮族自治区|回族自治区|维吾尔自治区)?/);
+  return m?.[1] || null;
+}
+
+function entitySectorsIn(value) {
+  const s = String(value || '').replace(/\s+/g, '');
+  const out = [];
+  if (/铝冶炼|电解铝/.test(s)) out.push('铝冶炼');
+  if (/钢铁/.test(s)) out.push('钢铁');
+  if (/水泥/.test(s)) out.push('水泥');
+  if (/发电|电力/.test(s)) out.push('发电');
+  return [...new Set(out)];
+}
+
+function normalizeEntitySector(value) {
+  const hits = entitySectorsIn(value);
+  return hits.length === 1 ? hits[0] : null;
+}
+
+/**
+ * 仅在表头没有独立行业列、且同一表混合多个行业时，用**无歧义**的国民经济行业
+ * 分类代码兜底。2511 等代码可能是发电名单中的自备电厂主业代码，故意不映射；
+ * 有明确分节/表标题时仍以标题行业优先。
+ */
+function industryCodeSector(value) {
+  const codes = [...String(value || '').matchAll(/(?<!\d)(\d{4})(?!\d)/g)].map((m) => m[1]);
+  const map = {
+    4411: '发电', 4412: '发电',
+    3011: '水泥',
+    3110: '钢铁', 3120: '钢铁', 3130: '钢铁', 3140: '钢铁',
+    3216: '铝冶炼',
+  };
+  const hits = [...new Set(codes.map((c) => map[c]).filter(Boolean))];
+  return hits.length === 1 ? hits[0] : null;
+}
+
+function titleEntitySector(value) {
+  // 表标题上下文可能把「现将…发电、钢铁、水泥、铝冶炼行业名录公告如下」公告句
+  // 与真正的分行业标题拼在一起。只取最后一个句号后的明确标题，避免把多行业公告句
+  // 当成表头行业而返回 null。
+  const s = String(value || '').replace(/\s+/g, ' ').trim();
+  if (!s) return null;
+  const last = s.split(/[。；;]/).filter(Boolean).pop() || s;
+  const hits = entitySectorsIn(last);
+  if (hits.length === 1) return hits[0];
+  if (hits.length === 0) return normalizeEntitySector(s);
+  return null;
+}
+
+function isOutOfScopeEntityText(value) {
+  return ENTITY_OUT_OF_SCOPE_RE.test(String(value || ''));
+}
+
+function hasEntityHeader(text) {
+  const s = String(text || '');
+  return /企业名称|单位名称/.test(s) && /统一社会信用代码|信用代码|序号/.test(s);
+}
+
+/**
+ * 识别名录年度。只读取包含「重点排放单位名录/名单」的标题行及其前两行，
+ * 取**最靠近名录标识**的年度；避免把「发布时间 2025-10-27」或
+ * 「关于做好2025年全国碳市场工作的通知」误作 2026 名录年度。
+ *
+ * 多个不同的名录标题年度 → conflict=true，由调用方登记缺口，不猜测。
+ * 原文没有年度时才使用来源登记年度（listYear）。
+ */
+export function detectEntityListYear(raw, { listYear = null } = {}) {
+  const text = looksLikeHtml(raw) ? htmlToText(raw) : String(raw || '');
+  const lines = entityLines(text);
+  const candidates = [];
+  const seen = new Set();
+  const add = (year, quote) => {
+    const n = Number(year);
+    if (!Number.isInteger(n) || n < 2000 || n > 2100 || seen.has(n)) return;
+    seen.add(n);
+    candidates.push({ year: n, quote: String(quote || '').replace(/\s+/g, ' ').slice(0, 160) });
+  };
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    if (!LIST_MARKER_RE.test(line)) continue;
+    if (ENTITY_NAV_RE.test(line)) continue;
+    const windowText = [lines[i - 2], lines[i - 1], line].filter(Boolean).join(' ');
+    // 必须定位**当前行自己的**名录标识；windowText 前面可能还有上一行标题，
+    // 用 search() 会取到上一行的标识，导致第二个年度被跳过。
+    const markerInLine = line.search(LIST_MARKER_RE);
+    if (markerInLine < 0) continue;
+    const markerAt = windowText.length - line.length + markerInLine;
+    const before = windowText.slice(Math.max(0, markerAt - 120), markerAt);
+    const years = [...before.matchAll(/(20\d{2})(?=\s*年)/g)].map((m) => Number(m[1]));
+    if (years.length) {
+      add(years[years.length - 1], windowText);
+      continue;
+    }
+    const after = windowText.slice(markerAt, markerAt + 100);
+    const afterYear = after.match(/(20\d{2})\s*年/);
+    if (afterYear) add(Number(afterYear[1]), windowText);
+  }
+  const distinct = [...new Set(candidates.map((c) => c.year))];
+  if (distinct.length > 1) {
+    return {
+      year: null, year_source: null, candidates, conflict: true,
+      reason: `名录年度在原文中冲突：${distinct.join('、')}；不猜测，返回缺口`,
+    };
+  }
+  if (distinct.length === 1) {
+    return { year: distinct[0], year_source: '原文', candidates, conflict: false, reason: null };
+  }
+  const metaYear = Number(listYear);
+  if (Number.isInteger(metaYear) && metaYear >= 2000 && metaYear <= 2100) {
+    return { year: metaYear, year_source: '来源登记年度', candidates, conflict: false, reason: null };
+  }
+  return {
+    year: null, year_source: null, candidates, conflict: false,
+    reason: '原文标题与来源登记均未明确名录年度；不拿当前年份顶替',
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/*  名称/代码/地区/行业字段（只做原文列值规范化，不做跨列拼接）          */
+/* ------------------------------------------------------------------ */
+
+function stripTrailingRemarks(value) {
+  return String(value || '')
+    .replace(/(?:\s+(?:自备电厂|自备|电厂|热电厂|长流程|短流程|备注))+$/g, '')
+    .trim();
+}
+
+function cleanEntityName(value) {
+  let s = stripTrailingRemarks(String(value || ''))
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/[\u00a0\u3000]/g, ' ')
+    .trim()
+    .replace(/^[|｜\s]+|[|｜\s]+$/g, '');
+  // 只剥离行号：阿拉伯数字可无分隔符；中文数字必须带「、.）」等分隔符，
+  // 否则「四川亚东水泥有限公司」会被误剥成「川亚东水泥有限公司」。
+  s = s.replace(/^[0-9]{1,4}\s*[、.．)）]?\s*/, '')
+    .replace(/^[一二三四五六七八九十]{1,4}\s*[、.．)）]\s*/, '');
+  const codeAt = s.search(CREDIT_TOKEN_ONE_RE);
+  if (codeAt >= 0) s = s.slice(0, codeAt);
+  return s.replace(/\s+/g, '').replace(/[，,;；、]+$/g, '').trim();
+}
+
+function validEntityName(name) {
+  const s = String(name || '').trim();
+  return s.length >= 4 && s.length <= 80 && ORG_SUFFIX_RE.test(s) && !NOT_ENTITY_RE.test(s) && !/^\d+$/.test(s);
+}
+
+function creditInfo(value) {
+  const m = String(value || '').replace(/[\s\u00a0\u3000]/g, '').toUpperCase().match(CREDIT_TOKEN_ONE_RE);
+  const raw = m?.[0] || null;
+  const valid = !!raw && validEntityCreditCode(raw);
+  return { raw, credit_code: valid ? raw : null, valid };
+}
+
+function cleanCity(value) {
+  let s = String(value || '').replace(/[\s\u00a0\u3000]+/g, '').replace(/^[：:]+|[，,;；]+$/g, '');
+  if (!s) return null;
+  if (/[\/／]/.test(s)) s = s.split(/[\/／]/).filter(Boolean).pop() || s;
+  return s || null;
+}
+
+function findCity(value) {
+  const s = String(value || '').replace(/\s+/g, ' ');
+  // 地区前常带「长流程」「铝冶炼」「自备电厂」等列值，先按空白/标点切分，
+  // 再从右向左找明确的行政区后缀；不把公司名中的「万州」误当地区。
+  const tokens = s.split(/[\s,，;；、|/／]+/).filter(Boolean).reverse();
+  for (const token of tokens) {
+    const cleaned = token
+      .replace(/[（(][^）)]*[）)]/g, '')
+      .replace(/^(?:长流程|短流程|铝冶炼|电解铝|水泥|钢铁|电力|有色|建材|自备电厂|既有|新增|退出)+/, '')
+      .replace(/[0-9]/g, '');
+    if (/(?:市|盟|地区|县|区|自治州)$/.test(cleaned) && cleaned.length >= 2) return cleaned;
+  }
+  return null;
+}
+
+/** PDF 表格换行：地区列上一行「凉山彝族自」+ 下一行「治州」 */
+function wrappedCityFromLines(lines, start) {
+  let buf = '';
+  for (let j = start; j < lines.length && j < start + 3; j += 1) {
+    const line = String(lines[j] || '').replace(/\s+/g, '');
+    if (!line || /^\d/.test(line) || CREDIT_TOKEN_ONE_RE.test(line) || ORG_SUFFIX_RE.test(line)) break;
+    buf += line;
+    if (/(?:市|州|盟|地区|县|区)$/.test(buf)) return { city: buf, count: j - start + 1 };
+    if (!/[\u4e00-\u9fa5]/.test(line)) break;
+  }
+  return null;
+}
+
+function statusFromText(value) {
+  if (/新增/.test(String(value || ''))) return 'new';
+  if (/退出/.test(String(value || ''))) return 'exit';
+  if (/既有/.test(String(value || ''))) return 'existing';
+  return null;
+}
+
+const ENTITY_SECTOR_ORDER = ['发电', '钢铁', '水泥', '铝冶炼'];
+
+/** 把「发电、钢铁」/「电力(44)」/分节标签拆成去重的纳管行业。 */
+function sectorTags(value) {
+  const parts = Array.isArray(value) ? value : String(value || '').split(/[、,，;；/／|]+/);
+  const out = [];
+  for (const part of parts) {
+    for (const hit of entitySectorsIn(part)) if (!out.includes(hit)) out.push(hit);
+  }
+  return out.sort((a, b) => ENTITY_SECTOR_ORDER.indexOf(a) - ENTITY_SECTOR_ORDER.indexOf(b));
+}
+
+function joinSectorTags(tags) {
+  return tags.length ? tags.join('、') : null;
+}
+
+/** 对外暴露同一套行业标签拆分规则，供成员关系入库复用。 */
+export function entitySectorTags(value) {
+  return sectorTags(value);
+}
+
+function rowSourceRef(row) {
+  if (Array.isArray(row.row_sources) && row.row_sources.length) return row.row_sources;
+  if (row.source_row === undefined || row.source_row === null) return [];
+  return [{ source_row: row.source_row, sector: row.sector || null, note: row.note || null }];
+}
+
+/**
+ * 同一原件内按信用代码去重：**合并**跨表/跨节的行业与行出处，不能只留最后一行。
+ * 单行仍保持原来的字段形状；多行时 sector 用「、」连接，row_sources 保留每一行出处。
+ */
+function dedupeEntityRows(rows) {
+  const merged = new Map();
+  for (const row of rows) {
+    const key = row.credit_code || `name:${row.name}`;
+    const incomingTags = sectorTags([
+      ...(Array.isArray(row.sectors) ? row.sectors : []),
+      row.sector,
+      row.source_sector,
+    ]);
+    const incomingSources = rowSourceRef(row);
+    const incomingNotes = Array.isArray(row.notes) && row.notes.length ? row.notes : (row.note ? [row.note] : []);
+    const prev = merged.get(key);
+    if (!prev) {
+      merged.set(key, {
+        ...row,
+        sectors: incomingTags,
+        row_sources: incomingSources,
+        notes: incomingNotes,
+      });
+      continue;
+    }
+    const tags = [...new Set([...(prev.sectors || []), ...incomingTags])]
+      .sort((a, b) => ENTITY_SECTOR_ORDER.indexOf(a) - ENTITY_SECTOR_ORDER.indexOf(b));
+    const refs = [...(prev.row_sources || [])];
+    for (const ref of incomingSources) {
+      if (!refs.some((x) => x.source_row === ref.source_row && String(x.sector || '') === String(ref.sector || ''))) {
+        refs.push(ref);
+      }
+    }
+    const notes = [...new Set([...(prev.notes || []), ...incomingNotes])];
+    merged.set(key, {
+      ...prev,
+      // 同代码的行只补空字段；名称/年度等以首次出现为准，具体差异留在各行 note 中。
+      name: prev.name || row.name,
+      province: prev.province || row.province || null,
+      city: prev.city || row.city || null,
+      raw_credit_code: prev.raw_credit_code || row.raw_credit_code || null,
+      credit_code_valid: !!(prev.credit_code_valid || row.credit_code_valid),
+      source_sector: prev.source_sector || row.source_sector || null,
+      status: prev.status || row.status || null,
+      sectors: tags,
+      row_sources: refs,
+      notes,
+    });
+  }
+  const out = [];
+  for (const row of merged.values()) {
+    const tags = row.sectors || [];
+    const refs = row.row_sources || [];
+    const notes = row.notes || [];
+    out.push({
+      ...row,
+      sector: joinSectorTags(tags),
+      sectors: tags,
+      source_rows: [...new Set(refs.map((x) => x.source_row).filter((n) => n !== undefined && n !== null))].sort((a, b) => a - b),
+      row_sources: refs,
+      note: notes.length ? notes.join('；') : (row.note || null),
+      notes,
+    });
+  }
+  return out;
+}
+
+function entityRowNote(rowNo, rawCode, valid, kind, { preserveCredit = false } = {}) {
+  const invalidText = preserveCredit
+    ? '位数或校验位异常，仅标注并保留原文'
+    : '位数或校验位异常，标准信用代码留空';
+  const codeText = rawCode
+    ? `${rawCode}（${valid ? '18位及校验位通过' : invalidText}）`
+    : '未披露';
+  return `原表第${rowNo || '—'}行；原表信用代码：${codeText}；${kind}，行业/地区不拼入名称。`;
+}
+
+/* ------------------------------------------------------------------ */
+/*  HTML 表格：按真实 <table>/<tr>/<td> 取列，支持列顺序变化和多表行业    */
+/* ------------------------------------------------------------------ */
+
+function htmlCellText(value) {
+  return htmlToText(String(value || '')).replace(/\s+/g, ' ').trim();
+}
+
+function extractHtmlTables(html) {
+  const out = [];
+  const re = /<table\b[^>]*>([\s\S]*?)<\/table>/gi;
+  let m;
+  let lastEnd = 0;
+  while ((m = re.exec(String(html || '')))) {
+    const before = String(html).slice(lastEnd, m.index);
+    const rows = [...m[1].matchAll(/<tr\b[^>]*>([\s\S]*?)<\/tr>/gi)].map((row) => (
+      [...row[1].matchAll(/<(?:td|th)\b[^>]*>([\s\S]*?)<\/(?:td|th)>/gi)].map((cell) => htmlCellText(cell[1]))
+    ));
+    out.push({ before, rows });
+    lastEnd = re.lastIndex;
+  }
+  return out;
+}
+
+function tableTitleContext(beforeHtml) {
+  const lines = entityLines(htmlToText(beforeHtml));
+  let at = -1;
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    if (LIST_MARKER_RE.test(lines[i])) { at = i; break; }
+  }
+  if (at < 0) return '';
+  return lines.slice(Math.max(0, at - 2), at + 1).join(' ');
+}
+
+function findEntityTableHeader(rows) {
+  const headerAt = rows.findIndex((cells) => {
+    const joined = cells.join('').replace(/\s+/g, '');
+    return /企业名称|单位名称/.test(joined) && /统一社会信用代码|信用代码|序号/.test(joined);
+  });
+  if (headerAt < 0) return { headerAt: -1, header: null };
+  return {
+    headerAt,
+    header: rows[headerAt].map((cell) => String(cell || '').replace(/[\s\u00a0\u3000]/g, '').replace(/[（）()]/g, '')),
+  };
+}
+
+function firstTableNumber(rows) {
+  for (const cells of rows) {
+    const first = String(cells.find((cell) => String(cell || '').trim()) || '').trim();
+    if (!first) continue;
+    return /^\d{1,4}$/.test(first) ? Number(first) : null;
+  }
+  return null;
+}
+
+/** 续表判断必须同时满足：同列结构、行序连续、没有相反的新名录标题。 */
+function canContinueEntityTable(prev, rows, title) {
+  if (!prev?.header || !Number.isInteger(prev.lastRowNo)) return false;
+  const firstNo = firstTableNumber(rows);
+  if (!Number.isInteger(firstNo) || firstNo !== prev.lastRowNo + 1) return false;
+  const firstData = rows.find((cells) => cells.some((cell) => String(cell || '').trim()));
+  if (!firstData || firstData.length !== prev.header.length) return false;
+  const titleHasMarker = LIST_MARKER_RE.test(String(title || ''));
+  if (titleHasMarker) {
+    const nextSector = titleEntitySector(title);
+    const prevSector = titleEntitySector(prev.title || '');
+    if (nextSector && prevSector && nextSector !== prevSector) return false;
+    if (!prev.title || !LIST_MARKER_RE.test(prev.title)) return false;
+    if (nextSector && !prevSector) return false;
+  }
+  // 非名录标题（如页眉/页码）不构成续表依据，交给行序与同列结构判断。
+  return true;
+}
+
+function parseHtmlEntityTable(rows, opts = {}, { fallbackHeader = null } = {}) {
+  const found = findEntityTableHeader(rows);
+  const header = found.header || fallbackHeader;
+  if (!header || !header.length) return { rows: [], header: null, lastRowNo: null, fallback: false };
+  const headerAt = found.headerAt;
+  const startAt = headerAt >= 0 ? headerAt + 1 : 0;
+  const fallback = headerAt < 0;
+  const idx = (re) => header.findIndex((h) => re.test(h));
+  const nameIdx = idx(/企业名称|单位名称/) >= 0 ? idx(/企业名称|单位名称/) : idx(/名称/);
+  const creditIdx = idx(/统一社会信用代码|信用代码/);
+  const regionIdx = idx(/所属区|行政区划|地区|所在地|地市|城市/);
+  const sectorIdx = header.findIndex((h) => /核算行业|所属行业|行业类别/.test(h) && !/代码/.test(h));
+  const subSectorIdx = idx(/核算子行业|子行业/);
+  const industryCodeIdx = header.findIndex((h) => /国民经济行业分类代码|行业分类代码|行业代码/.test(h));
+  const statusIdx = header.findIndex((h) => /^(状态|既有新增|既有\/新增)$/.test(h));
+  const noIdx = idx(/^序号$/);
+  const titleSector = titleEntitySector(opts.title || '');
+  const out = [];
+  let currentSector = titleSector;
+  let lastRowNo = null;
+
+  for (let r = startAt; r < rows.length; r += 1) {
+    const cells = rows[r].map((cell) => String(cell || '').replace(/\s+/g, ' ').trim());
+    const nonEmpty = cells.filter(Boolean);
+    if (!nonEmpty.length) continue;
+    if (nonEmpty.length === 1) {
+      const section = titleEntitySector(nonEmpty[0]);
+      if (section && /行业/.test(nonEmpty[0])) { currentSector = section; continue; }
+      if (/^(合计|总计|注|说明)/.test(nonEmpty[0])) continue;
+    }
+    const joined = cells.join(' ');
+    if (/企业名称|统一社会信用代码/.test(joined)) continue;
+
+    let name = cleanEntityName(nameIdx >= 0 ? cells[nameIdx] : '');
+    if (!validEntityName(name)) {
+      name = cells.map(cleanEntityName).find((c) => validEntityName(c) && !LIST_MARKER_RE.test(c)) || '';
+    }
+    if (!validEntityName(name)) continue;
+
+    const credit = creditInfo(creditIdx >= 0 ? cells[creditIdx] : joined);
+    const rawSector = [sectorIdx >= 0 ? cells[sectorIdx] : '', subSectorIdx >= 0 ? cells[subSectorIdx] : '']
+      .filter(Boolean).join(' ');
+    const industryCode = industryCodeIdx >= 0 ? cells[industryCodeIdx] : '';
+    const rowSector = normalizeEntitySector(rawSector);
+    const sector = currentSector || titleSector || rowSector || industryCodeSector(industryCode) || normalizeEntitySector(opts.sector);
+    // 没有地区列时保持 NULL：不从企业名称里猜「万州」这类地名
+    const city = regionIdx >= 0 ? cleanCity(cells[regionIdx]) : null;
+    const status = statusFromText(statusIdx >= 0 ? cells[statusIdx] : '') || statusFromText(joined) || 'existing';
+    const rawNo = noIdx >= 0 ? cells[noIdx] : '';
+    const rowNo = /^\d{1,4}$/.test(rawNo) ? Number(rawNo) : (r - headerAt);
+    const province = opts.province || entityProvince(opts.text || opts.title || '');
+    out.push({
+      name,
+      credit_code: credit.credit_code,
+      raw_credit_code: credit.raw,
+      credit_code_valid: credit.valid,
+      province,
+      city,
+      sector,
+      source_sector: rawSector || currentSector || titleSector || null,
+      list_year: opts.year,
+      year_source: opts.yearSource,
+      province_source: opts.province ? '来源登记省份' : (province ? '原文' : null),
+      status,
+      source_row: rowNo,
+      note: entityRowNote(rowNo, credit.raw, credit.valid, 'HTML表格按表头列名解析'),
+    });
+    lastRowNo = rowNo;
+  }
+  return { rows: dedupeEntityRows(out), header, lastRowNo, fallback };
+}
+
+function parseHtmlEntityTables(html, opts = {}) {
+  const out = [];
+  // Word 分页续表不重复表头：只在上一个明确表头、列数一致、行序连续且无相反新标题时复用。
+  let prev = null;
+  for (const table of extractHtmlTables(html)) {
+    const title = tableTitleContext(table.before);
+    if (title && isOutOfScopeEntityText(title)) { prev = null; continue; }
+    const titleHasMarker = !!title && LIST_MARKER_RE.test(title);
+    const hasRows = table.rows.some((cells) => cells.some((cell) => String(cell || '').trim()));
+    if (!titleHasMarker && !prev) continue;
+    const ownHeader = findEntityTableHeader(table.rows).header;
+    let fallbackHeader = null;
+    if (prev && !ownHeader && canContinueEntityTable(prev, table.rows, title)) {
+      fallbackHeader = prev.header;
+    }
+    if (!titleHasMarker && !fallbackHeader) {
+      // 无标题、不能证明是续表的非空表格：断开续表链，避免后续任意表继承旧表头。
+      if (hasRows) prev = null;
+      continue;
+    }
+    const effectiveTitle = titleHasMarker ? title : (prev?.title || '');
+    const parsed = parseHtmlEntityTable(table.rows, { ...opts, title: effectiveTitle }, { fallbackHeader });
+    if (parsed.rows.length) {
+      out.push(...parsed.rows);
+      prev = {
+        header: parsed.header,
+        title: effectiveTitle,
+        lastRowNo: parsed.lastRowNo,
+      };
+    } else if (titleHasMarker || (hasRows && !fallbackHeader)) {
+      // 新标题但表头缺失/不可续，或非空异常表：不能把更后面的表接到旧表头上。
+      prev = null;
+    }
+  }
+  return dedupeEntityRows(out);
+}
+
+/* ------------------------------------------------------------------ */
+/*  PDF / 纯文本：信用代码锚点 + 换行名称/地区，保留 OCR 逐单元格路径     */
+/* ------------------------------------------------------------------ */
+
+function rowsFromClassic(records, opts = {}) {
+  const textProvince = entityProvince(opts.text || '');
+  const province = textProvince || opts.province || null;
+  const out = [];
+  for (const c of records) {
+    if (!ORG_SUFFIX_RE.test(c[2]) || !Number.isInteger(opts.year)) continue;
+    const valid = validEntityCreditCode(c[4]);
+    const sourceSector = String(c[3] || '').trim() || null;
+    out.push({
+      name: c[2],
+      credit_code: valid ? c[4] : null,
+      raw_credit_code: c[4],
+      credit_code_valid: valid,
+      province,
+      city: c[1],
+      // 经典 OCR 路径：行业识别不出来时保持 NULL，不拿标题行业覆盖（docs/44 回归）
+      sector: normalizeEntitySector(sourceSector),
+      source_sector: sourceSector,
+      list_year: opts.year,
+      status: c[5] === '新增' ? 'new' : c[5] === '既有' ? 'existing' : c[5] === '退出' ? 'exit' : 'unknown',
+      source_row: Number(c[0]),
+      year_source: opts.yearSource,
+      province_source: textProvince ? '原文' : (opts.province ? '来源登记省份' : null),
+      note: `原表第${c[0]}行；原表信用代码：${c[4]}（${valid ? '18位及校验位通过' : '位数或校验位异常，标准信用代码留空'}）；OCR提取不等同独立核验。`,
+    });
+  }
+  return dedupeEntityRows(out);
+}
+
+function looksLikePendingName(line) {
+  const s = String(line || '').trim();
+  if (!s || CREDIT_TOKEN_ONE_RE.test(s)) return false;
+  if (LIST_MARKER_RE.test(s)) return false;
+  if (/^(序号|序\s|号\s|分类代码|国民经济行业|企业名称|单位名称|统一社会信用代码|信用代码|核算行业|核算子行业|地区|行业|备注|附件|自备|长流程|短流程)/.test(s)) return false;
+  if (/^(自备|电厂|热电厂|长流程|短流程|备注)$/.test(s)) return false;
+  if (/^[\d\s.、()（）—\-–]+$/.test(s)) return false;
+  // 名称片段可能因版面右侧的备注而带大量空格（如「…有限公司        自备」）。
+  // 先剥离行尾备注再判断长度，否则真实的换行公司名会被误当成页眉丢弃。
+  const candidate = stripTrailingRemarks(s).replace(/\s+/g, '');
+  if (/^[（(]/.test(candidate)) return false;
+  // 行业子类的换行片段，如「水泥(硅酸盐」「水泥熟料)」，不是企业名称
+  if (/^(水泥|钢铁|有色|建材|电力|发电|铝冶炼|自备|长流程|短流程)[（(]/.test(candidate)) return false;
+  if (/[)）]$/.test(candidate) && !/公司|厂|集团|中心/.test(candidate)) return false;
+  if (/(?:市|州|盟|地区|县|区)$/.test(candidate) && !/公司|厂|集团|中心/.test(candidate)) return false;
+  if (candidate.length > 50) return false;
+  return /[\u4e00-\u9fa5]/.test(candidate);
+}
+
+function parseAnchorTextRows(text, opts = {}) {
+  const lines = entityLines(text).filter((line) => !/^[—\-–]\s*\d+\s*[—\-–]$/.test(line));
+  const rows = [];
+  const pending = [];
+  let pendingRemark = false;
+  let currentSector = null;
+  let sequence = 0;
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    if (!CREDIT_TOKEN_ONE_RE.test(line)) {
+      if (/(?:行业|名录|名单)/.test(line) && !/公司|厂/.test(line)) {
+        const section = titleEntitySector(line);
+        if (section) currentSector = section;
+        pending.length = 0;
+      }
+      // 「自备/电厂」是备注换行，不能作为下一条企业名称的前缀
+      if (/^(自备|电厂|热电厂|长流程|短流程|备注)$/.test(line)) {
+        if (line === '自备') pendingRemark = true;
+        pending.length = 0;
+        continue;
+      }
+      if (/^(号\s|序\s|分类代码|国民经济行业|企业名称|统一社会信用代码)/.test(line)) {
+        pending.length = 0;
+        continue;
+      }
+      if (looksLikePendingName(line)) {
+        const fragment = stripTrailingRemarks(line);
+        // 新行本身已是完整企业名时，重置 pending，避免把上一行备注拼进来
+        if (validEntityName(fragment)) pending.length = 0;
+        pending.push(fragment);
+        if (pending.length > 3) pending.shift();
+      }
+      continue;
+    }
+
+    const codeMatch = line.match(CREDIT_TOKEN_ONE_RE);
+    const rawCode = codeMatch?.[0];
+    if (!codeMatch || !rawCode) continue;
+    const before = line.slice(0, codeMatch.index);
+    const after = line.slice(codeMatch.index + rawCode.length);
+    const noMatch = before.match(/^\s*(\d{1,4})\s*[、.．)）]?\s*/);
+    const rowNo = noMatch ? Number(noMatch[1]) : null;
+    const namePart = cleanEntityName(noMatch ? before.slice(noMatch[0].length) : before);
+
+    let name = namePart;
+    if (!name && pending.length) {
+      name = cleanEntityName(pending.join(''));
+    } else if (name && !validEntityName(name) && pending.length) {
+      // 名称前半段在上一行、后半段在本行代码前（如「…有限」+「公司」）
+      const combined = cleanEntityName(`${pending.join('')}${name}`);
+      if (combined) name = combined;
+    }
+
+    // 名称被 PDF 拆行：上一行「…有限公」+ 本行代码后「司」，或「…东部」+「电厂」
+    const rowHasRemark = pendingRemark;
+    pendingRemark = false;
+    let extra = 0;
+    while (!ORG_SUFFIX_RE.test(name) && i + 1 + extra < lines.length && extra < 2) {
+      const frag = stripTrailingRemarks(lines[i + 1 + extra]).replace(/\s+/g, '');
+      // 有「自备」备注时，行尾的「电厂」是备注而不是名称后缀；「公司」仍可作为名称补全
+      if (rowHasRemark && /^(电厂|热电厂)$/.test(frag)) break;
+      if (frag === '自备电厂') break;
+      if (!/^[\u4e00-\u9fa5]{1,6}$/.test(frag)) break;
+      const candidate = cleanEntityName(`${name}${frag}`);
+      if (!ORG_SUFFIX_RE.test(candidate)) break;
+      name = candidate;
+      extra += 1;
+    }
+    // 表格单元在「有限公司」后仍有换行后缀（如「华能…有限公司 / 海门电厂」）：
+    // 仅接一个短组织后缀行，避免把下一条完整企业名拼进来。
+    let tail = 0;
+    while (!rowHasRemark && tail < 1 && i + 1 + extra + tail < lines.length) {
+      const frag = stripTrailingRemarks(lines[i + 1 + extra + tail]).replace(/\s+/g, '');
+      // 「自备电厂」是备注换行，不是公司名后缀；「南山热电厂/东部电厂」仍应接上。
+      if (frag === '自备电厂') break;
+      if (!/^(?:[\u4e00-\u9fa5]{2,8}(?:电厂|分公司|集团|中心)|[\u4e00-\u9fa5]{2,8}厂)$/.test(frag)) break;
+      const candidate = cleanEntityName(`${name}${frag}`);
+      if (!ORG_SUFFIX_RE.test(candidate)) break;
+      name = candidate;
+      tail += 1;
+    }
+    pending.length = 0;
+    if (!validEntityName(name)) continue;
+
+    const nextAt = i + 1 + extra + tail;
+    let city = cleanCity(findCity(after));
+    let regionExtra = 0;
+    if (!city) {
+      const wrapped = wrappedCityFromLines(lines, nextAt);
+      if (wrapped) { city = wrapped.city; regionExtra = wrapped.count; }
+    }
+    const status = statusFromText(line) || statusFromText(lines[nextAt] || '') || 'existing';
+    const rowSector = normalizeEntitySector(after);
+    const titleSector = titleEntitySector(entityTitleContext(text));
+    const sector = currentSector || titleSector || rowSector || industryCodeSector(after) || normalizeEntitySector(opts.sector);
+    const province = opts.province || entityProvince(text);
+    const valid = validEntityCreditCode(rawCode);
+    sequence += 1;
+    rows.push({
+      name,
+      credit_code: valid ? rawCode : null,
+      raw_credit_code: rawCode,
+      credit_code_valid: valid,
+      province,
+      city,
+      sector,
+      source_sector: (currentSector || titleSector || (after ? after.slice(0, 60) : null)),
+      list_year: opts.year,
+      year_source: opts.yearSource,
+      province_source: opts.province ? '来源登记省份' : (province ? '原文' : null),
+      status,
+      source_row: rowNo || sequence,
+      note: entityRowNote(rowNo || sequence, rawCode, valid, 'PDF文本按信用代码锚点解析'),
+    });
+    i += extra + tail + regionExtra;
+  }
+  return dedupeEntityRows(rows);
+}
+
+function legacyEntityRows(text, opts = {}) {
+  const rows = toRows(text);
+  const out = [];
+  let seq = 0;
+  for (const cells of rows) {
+    const joined = cells.join(' ');
+    const cc = joined.match(LEGACY_CC_RE);
+    const anyCode = joined.match(CREDIT_TOKEN_ONE_RE);
+    const nameCand = cells
+      .filter((c) => !CREDIT_TOKEN_ONE_RE.test(c) && /[\u4e00-\u9fa5]{3,}/.test(c))
+      .filter((c) => !NOT_ENTITY_RE.test(c))
+      .map(cleanEntityName)
+      .filter(validEntityName)
+      .filter((c) => (cc && joined.includes(c)) || ORG_SUFFIX_RE.test(c))
+      .sort((a, b) => b.length - a.length)[0];
+    if (!nameCand) continue;
+    seq += 1;
+    const rawCode = cc?.[1] || anyCode?.[0] || null;
+    const first = cells[0];
+    const rowNo = /^\d{1,4}$/.test(first) ? Number(first) : seq;
+    out.push({
+      name: nameCand,
+      // 保持既有兜底契约：18 位原文即写入 credit_code，校验位异常只标注
+      credit_code: cc?.[1] || null,
+      raw_credit_code: rawCode,
+      credit_code_valid: !!cc?.[1] && validEntityCreditCode(cc[1]),
+      province: opts.province || null,
+      city: null,
+      sector: null,
+      source_sector: null,
+      list_year: opts.year,
+      year_source: opts.yearSource,
+      province_source: opts.province ? '来源登记省份' : null,
+      status: 'existing',
+      source_row: rowNo,
+      note: entityRowNote(rowNo, rawCode, !!cc?.[1] && validEntityCreditCode(cc[1]), '文本兜底解析（无表头）', { preserveCredit: true }),
+    });
+  }
+  return dedupeEntityRows(out);
+}
+
 /**
  * 从公开名录原文中提取行。**只提取原文明确出现的主体**：
  * 统一社会信用代码缺失时保留 NULL，不推测；不合并同一集团下不同法人。
- * 页面不像名录、或识别出的行少于 `minRows` 时返回空数组，由调用方登记缺口。
+ * 页面不像名录、或识别出的行少于阈值时返回空数组，由调用方登记缺口。
+ *
+ * 年度纪律：只认名录标题/表标题附近的年度；多个不同年度 → 返回空数组（缺口）。
+ * 行业纪律：优先表标题/分节行业，其次行内行业，最后来源登记 sector；
+ *           不把国民经济行业分类代码（如 2511）当实际纳管类别。
+ * 小名单纪律：有正式名录标题 + 可识别表头 + 企业名称/代码时允许 1 行；
+ *           无表头的兜底文本仍要求至少 3 行，不靠放宽全局 minRows 收任意页面。
  *
  * @param {string} raw
- * @param {{listYear?:number|null, province?:string|null, minRows?:number, provinceName?:string|null}} [opts]
+ * @param {{listYear?:number|null, province?:string|null, sector?:string|null, minRows?:number}} [opts]
  * @returns {Array<object>}
  */
-export function parseEntityRows(raw, { listYear = null, province = null, minRows = 3 } = {}) {
+export function parseEntityRows(raw, { listYear = null, province = null, sector = null, minRows = 3 } = {}) {
   const text = looksLikeHtml(raw) ? htmlToText(raw) : String(raw || '');
-  // 年度优先取**原文**出现的「20XX 年度」；调用方给出的是来源登记年度（也是可核对事实），
-  // 二者都没有时**不填**、不拿当前年份顶替（docs/36 第 8 条：不凭猜测填主体）。
-  const yearInText = (text.match(/(20\d{2})\s*年(?:\s*度)?/) || [])[1] || null;
-  const year = yearInText ? Number(yearInText) : (Number.isInteger(Number(listYear)) && Number(listYear) > 0 ? Number(listYear) : null);
-  const verdict = checkEntityPage(text, { listYear: year });
+  const yearInfo = detectEntityListYear(raw, { listYear });
+  if (yearInfo.conflict || !Number.isInteger(yearInfo.year)) return [];
+  if (isOutOfScopeEntityText(entityTitleContext(text))) return [];
+  const verdict = checkEntityPage(text, { listYear: yearInfo.year });
   if (!verdict.ok) return [];
-  const structured = structuredEntityCells(text);
-  if (structured.length) {
-    const provinceMatch = text.match(/(河北|山西|辽宁|吉林|黑龙江|江苏|浙江|安徽|福建|江西|山东|河南|湖北|湖南|广东|海南|四川|贵州|云南|陕西|甘肃|青海|台湾)省/);
-    const actualProvince = provinceMatch?.[1] || province || null;
-    const parsed = structured.filter(c => ORG_SUFFIX_RE.test(c[2]) && Number.isInteger(year)).map(c => {
-      const valid = validEntityCreditCode(c[4]);
-      return { name: c[2], credit_code: valid ? c[4] : null, raw_credit_code: c[4], credit_code_valid: valid,
-        province: actualProvince, city: c[1], sector: /^(发电|钢铁|水泥|铝冶炼|电解铝)$/.test(c[3]) ? (c[3] === '电解铝' ? '铝冶炼' : c[3]) : null, source_sector: c[3], list_year: year,
-        status: c[5] === '新增' ? 'new' : c[5] === '既有' ? 'existing' : c[5] === '退出' ? 'exit' : 'unknown',
-        source_row: Number(c[0]), year_source: yearInText ? '原文' : '来源登记年度',
-        province_source: provinceMatch ? '原文' : '来源登记省份',
-        note: `原表第${c[0]}行；原表信用代码：${c[4]}（${valid ? '18位及校验位通过' : '位数或校验位异常，标准信用代码留空'}）；OCR提取不等同独立核验。` };
-    });
-    const unique = [...new Map(parsed.map(r => [r.credit_code || `name:${r.name}`, r])).values()];
-    return unique.length >= Math.max(1, Number(minRows) || 3) ? unique : [];
+
+  const base = {
+    year: yearInfo.year, yearSource: yearInfo.year_source,
+    province, sector: normalizeEntitySector(sector), text,
+  };
+  const isHtml = looksLikeHtml(raw);
+  const hasTable = /<table\b/i.test(String(raw || ''));
+  let rows = [];
+  let trusted = false;
+
+  if (isHtml && hasTable) {
+    rows = parseHtmlEntityTables(raw, base);
+    trusted = rows.length > 0;
+    if (!rows.length) {
+      // 无表头/非企业表的 HTML 保持旧兜底行为（test/30 的 3 行简单表）
+      rows = legacyEntityRows(text, base);
+      trusted = hasEntityHeader(text);
+    }
+  } else {
+    const classic = structuredEntityCells(text);
+    if (classic.length) {
+      rows = rowsFromClassic(classic, base);
+      trusted = true;
+    } else {
+      rows = parseAnchorTextRows(text, base);
+      if (rows.length) {
+        trusted = true;
+      } else {
+        rows = legacyEntityRows(text, base);
+        trusted = hasEntityHeader(text);
+      }
+    }
   }
-  const rows = toRows(text);
-  const out = [];
-  const seen = new Set();
-  // 统一社会信用代码：18 位大写字母数字（官方编码字符集，排除 I/O/S/V/Z）
-  const CC_RE = /\b([0-9A-HJ-NPQRTUWXY]{18})\b/;
-  for (const cells of rows) {
-    const joined = cells.join(' ');
-    const cc = joined.match(CC_RE);
-    const nameCand = cells
-      .filter((c) => !CC_RE.test(c) && /[\u4e00-\u9fa5]{3,}/.test(c))
-      .filter((c) => !NOT_ENTITY_RE.test(c))
-      .map((c) => c.replace(/[\s　]+/g, '').replace(/^[0-9一二三四五六七八九十]+[、.．)）]?/, ''))
-      .filter((c) => c.length >= 4 && c.length <= 60)
-      // 必须有统一社会信用代码，或名称确实以组织机构后缀结尾
-      .filter((c) => (cc && joined.includes(c)) || ORG_SUFFIX_RE.test(c))
-      .filter((c) => ORG_SUFFIX_RE.test(c) || !!cc)
-      .sort((a, b) => b.length - a.length)[0];
-    if (!nameCand) continue;
-    const name = nameCand;
-    // 同一主体在同一年度只保留一行（标识 = 信用代码，缺代码时用名称）
-    const key = cc ? cc[1] : `name:${name}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push({
-      name,
-      credit_code: cc ? cc[1] : null,
-      // 省份：原文出现优先；否则用来源登记省份；都没有则 NULL（不猜测）
-      province: province || null,
-      city: null,
-      sector: null,
-      list_year: year,
-      year_source: yearInText ? '原文' : (year ? '来源登记年度' : null),
-      province_source: province ? '来源登记省份' : null,
-      status: 'existing',
-    });
-  }
-  // 行数过少说明这不是一份完整名录（多半是误命中的其他页面），宁可不入库
-  const valid = out.filter((r) => Number.isInteger(r.list_year));
-  return valid.length >= Math.max(1, Number(minRows) || 3) ? valid : [];
+
+  const unique = dedupeEntityRows(rows);
+  const threshold = trusted ? 1 : Math.max(1, Number(minRows) || 3);
+  return unique.length >= threshold ? unique : [];
 }
 
 /**

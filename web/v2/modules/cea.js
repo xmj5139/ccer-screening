@@ -956,6 +956,25 @@ async function renderCalendar(body, q) {
 /*  四、企业名录                                                        */
 /* ==================================================================== */
 
+function entitySourceCell(r) {
+  const entries = [];
+  const seen = new Set();
+  for (const m of Array.isArray(r.source_memberships) ? r.source_memberships : []) {
+    const href = safeHttpHref(m.source_url);
+    if (!href) continue;
+    const key = `${href}|${m.sector || ''}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    entries.push({ href, label: m.sector || '公开名录' });
+  }
+  if (entries.length <= 1) {
+    if (!entries.length) return clearingLink(r.source_url, '公开名录');
+    return `<a class="link" href="${entries[0].href}" target="_blank" rel="noreferrer noopener">公开名录</a>`;
+  }
+  return `<details class="tech-details"><summary>${entries.length} 个出处</summary>` +
+    `<div class="tech-details-body">${entries.map((e) => `<a class="link" href="${e.href}" target="_blank" rel="noreferrer noopener">${esc(e.label)}</a>`).join('<br>')}</div></details>`;
+}
+
 async function renderEntities(body, q) {
   const province = q.province || '';
   const sector = q.sector || '';
@@ -980,11 +999,11 @@ async function renderEntities(body, q) {
       { key: 'province', label: '省份', render: (r) => esc(r.province || '—') },
       { key: 'city', label: '城市', render: (r) => esc(r.city || '—') },
       { key: 'sector', label: '行业', render: (r) => esc(r.sector || '—') },
-      { key: 'list_year', label: '名录年度', align: 'right', render: (r) => num(r.list_year) },
+      { key: 'list_year', label: '名录年度', align: 'right', render: (r) => esc(String(r.list_year ?? '—')) },
       { key: 'status', label: '名录状态', render: (r) => esc(ENTITY_STATUS_LABEL[r.status] || r.status || '—') },
       { key: 'data_as_of', label: '数据截止日', render: (r) => esc(shortDate(r.data_as_of)) },
       { key: 'verify_status', label: '核验状态', render: (r) => verifyChip2(r.verify_status) },
-      { key: 'source_url', label: '来源', render: (r) => (r.source_url ? `<a class="link" href="${esc(r.source_url)}" target="_blank" rel="noreferrer noopener">公开名录</a>` : '—') },
+      { key: 'source_url', label: '来源', render: (r) => entitySourceCell(r) },
     ],
     emptyText: '没有名录条目',
   });
@@ -1016,9 +1035,9 @@ async function renderEntities(body, q) {
   </div>
 
   <div class="metrics metrics-sm">
-    ${metric({ label: '名录条目（筛选后）', value: num(data.total), unit: '条', sub: `本页 ${rows.length} 条｜覆盖省份 ${num(coverage.provinces)} 个`, asOf: '', source: 'cea_entity' })}
-    ${metric({ label: '名录年度', value: (coverage.list_years || []).join('、') || '—', unit: '', sub: '以统一社会信用代码 + 名录年度为标识', asOf: '', source: 'cea_entity.list_year' })}
-    ${metric({ label: '未披露信用代码', value: num(coverage.without_credit_code), unit: '条', sub: '公开名录未披露该字段时不推测', asOf: '', source: 'cea_entity.credit_code', warn: Number(coverage.without_credit_code) > 0 })}
+    ${metric({ label: '名录条目（筛选后）', value: num(data.total), unit: '条', sub: `本页 ${rows.length} 条｜全库覆盖省份 ${num(coverage.provinces)} 个`, asOf: coverage.as_of || '', source: '官方公开名录' })}
+    ${metric({ label: '名录年度', value: (coverage.list_years || []).join('、') || '—', unit: '', sub: '以统一社会信用代码 + 名录年度为标识', asOf: coverage.as_of || '', source: '官方公开名录' })}
+    ${metric({ label: '全库未披露信用代码', value: num(coverage.without_credit_code), unit: '条', sub: '公开名录未披露该字段时不推测', asOf: coverage.as_of || '', source: '官方公开名录', warn: Number(coverage.without_credit_code) > 0 })}
   </div>
 
   ${card({

@@ -107,6 +107,9 @@ export function migrate(db) {
       setMeta(db, 'schema_version_cea_applied', nowIso());
       setMeta(db, 'schema_version', '2.3.0');
     }
+    // 旧库只有 cea_entity 的最后来源字段；增量成员表建好后按原字段回填一次（幂等），
+    // 不删除、不改写任何既有企业行（福建 84 条等历史数据原样保留）。
+    backfillCeaEntityMemberships(db);
   }
 
   // ---- v2.4 公开碳核算资料库增量（docs/39：中碳登 / NCSC 因子库 / CETS / 标准规范）----
@@ -446,6 +449,53 @@ export function migrate(db) {
     );
   } catch {
     /* 表结构尚未就绪时忽略；下一次打开会重试 */
+  }
+}
+
+/**
+ * 旧库成员关系回填：cea_entity 的 source_code/sector/source_url/source_hash/snapshot_id/note
+ * 是该主体最后一次来源字段。增量建表后原样复制为一条成员关系，**不更新企业行**。
+ * INSERT OR IGNORE + 确定性 id 保证重复执行安全；没有来源的既有编辑行不制造成员关系。
+ */
+export function backfillCeaEntityMemberships(db) {
+  try {
+    const table = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='cea_entity_membership'").get();
+    if (!table) return 0;
+    // 仅迁移尚无成员关系的旧主体。聚合 sector 不能在重启时反推给最后一个 source_code。
+    const rows = db.prepare(
+      `SELECT id,source_code,sector,source_url,source_hash,snapshot_id,note,created_at,updated_at
+         FROM cea_entity
+        WHERE source_code IS NOT NULL AND source_code <> ''
+          AND NOT EXISTS (SELECT 1 FROM cea_entity_membership m WHERE m.entity_id=cea_entity.id)`
+    ).all();
+    if (!rows.length) return 0;
+    const exists = db.prepare(
+      `SELECT id FROM cea_entity_membership
+        WHERE entity_id=? AND source_code=? AND COALESCE(sector,'')=?`
+    );
+    const insert = db.prepare(
+      `INSERT INTO cea_entity_membership
+         (id,entity_id,source_code,sector,source_url,source_hash,snapshot_id,note,created_at,updated_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?)`
+    );
+    let changed = 0;
+    for (const row of rows) {
+      const sectors = row.sector
+        ? [...new Set(String(row.sector).split(/[、,，;；/]+/).map((s) => s.trim()).filter(Boolean))]
+        : [null];
+      for (const sector of sectors) {
+        if (exists.get(row.id, row.source_code, sector || '')) continue;
+        insert.run(
+          `CEAENTM-${row.id}-${row.source_code}-${sector || ''}`,
+          row.id, row.source_code, sector, row.source_url, row.source_hash, row.snapshot_id, row.note,
+          row.created_at || row.updated_at, row.updated_at || row.created_at
+        );
+        changed += 1;
+      }
+    }
+    return changed;
+  } catch {
+    return 0;
   }
 }
 
