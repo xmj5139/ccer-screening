@@ -1,0 +1,175 @@
+{
+  "source_url": "https://datas.carbonmonitor.org/API/downloadFullDataset.php?source=carbon_china",
+  "source_homepage": "https://cn.carbonmonitor.org/",
+  "sha256": "723709ff6cc610e121d502f0c0aa9adb55aa6531a616cb145109de4e12b0ae52",
+  "original_rows": 386107,
+  "duplicate_rows": 0,
+  "annual_records": 203,
+  "provinces": 29,
+  "years": [
+    2019,
+    2020,
+    2021,
+    2022,
+    2023,
+    2024,
+    2025
+  ],
+  "excluded": [
+    {
+      "state": "Heilongjiang",
+      "year": 2019,
+      "coverage": {
+        "Aviation": 0,
+        "Ground Transport": 365,
+        "Industry": 365,
+        "Power": 0,
+        "Residential": 365
+      }
+    },
+    {
+      "state": "Heilongjiang",
+      "year": 2020,
+      "coverage": {
+        "Aviation": 0,
+        "Ground Transport": 366,
+        "Industry": 366,
+        "Power": 0,
+        "Residential": 366
+      }
+    },
+    {
+      "state": "Heilongjiang",
+      "year": 2021,
+      "coverage": {
+        "Aviation": 0,
+        "Ground Transport": 365,
+        "Industry": 365,
+        "Power": 0,
+        "Residential": 365
+      }
+    },
+    {
+      "state": "Heilongjiang",
+      "year": 2022,
+      "coverage": {
+        "Aviation": 0,
+        "Ground Transport": 365,
+        "Industry": 365,
+        "Power": 0,
+        "Residential": 365
+      }
+    },
+    {
+      "state": "Heilongjiang",
+      "year": 2023,
+      "coverage": {
+        "Aviation": 0,
+        "Ground Transport": 365,
+        "Industry": 365,
+        "Power": 0,
+        "Residential": 365
+      }
+    },
+    {
+      "state": "Heilongjiang",
+      "year": 2024,
+      "coverage": {
+        "Aviation": 0,
+        "Ground Transport": 366,
+        "Industry": 366,
+        "Power": 0,
+        "Residential": 366
+      }
+    },
+    {
+      "state": "Heilongjiang",
+      "year": 2025,
+      "coverage": {
+        "Aviation": 0,
+        "Ground Transport": 365,
+        "Industry": 365,
+        "Power": 0,
+        "Residential": 365
+      }
+    },
+    {
+      "state": "Inner Mongolia",
+      "year": 2019,
+      "coverage": {
+        "Aviation": 0,
+        "Ground Transport": 365,
+        "Industry": 365,
+        "Power": 0,
+        "Residential": 365
+      }
+    },
+    {
+      "state": "Inner Mongolia",
+      "year": 2020,
+      "coverage": {
+        "Aviation": 0,
+        "Ground Transport": 366,
+        "Industry": 366,
+        "Power": 0,
+        "Residential": 366
+      }
+    },
+    {
+      "state": "Inner Mongolia",
+      "year": 2021,
+      "coverage": {
+        "Aviation": 0,
+        "Ground Transport": 365,
+        "Industry": 365,
+        "Power": 0,
+        "Residential": 365
+      }
+    },
+    {
+      "state": "Inner Mongolia",
+      "year": 2022,
+      "coverage": {
+        "Aviation": 0,
+        "Ground Transport": 365,
+        "Industry": 365,
+        "Power": 0,
+        "Residential": 365
+      }
+    },
+    {
+      "state": "Inner Mongolia",
+      "year": 2023,
+      "coverage": {
+        "Aviation": 0,
+        "Ground Transport": 365,
+        "Industry": 365,
+        "Power": 0,
+        "Residential": 365
+      }
+    },
+    {
+      "state": "Inner Mongolia",
+      "year": 2024,
+      "coverage": {
+        "Aviation": 0,
+        "Ground Transport": 366,
+        "Industry": 366,
+        "Power": 0,
+        "Residential": 366
+      }
+    },
+    {
+      "state": "Inner Mongolia",
+      "year": 2025,
+      "coverage": {
+        "Aviation": 0,
+        "Ground Transport": 365,
+        "Industry": 365,
+        "Power": 0,
+        "Residential": 365
+      }
+    }
+  ],
+  "note": "2026未满全年不导入；内蒙古、黑龙江源文件缺电力、航空，全年总量留空。"
+}

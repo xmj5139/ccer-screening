@@ -25,6 +25,7 @@ import { requireRole } from './services/project-svc.mjs';
 import { buildExport } from './services/export-svc.mjs';
 import { IMPORT_TEMPLATES, getTemplate, templateCsv, rowsFromCsv } from './data/import-templates.mjs';
 import * as dash from './services/dashboard-svc.mjs';
+import * as regionMap from './services/region-map-svc.mjs';
 import * as policy from './services/policy-svc.mjs';
 import * as projects from './services/project-v2-svc.mjs';
 import * as trade from './services/trade-svc.mjs';
@@ -294,6 +295,32 @@ const RAW_ROUTES = [
     const g = readGuard();
     if (g) return { status: g.status, body: g };
     return { market: dash.marketSeries({ range: ctx.query.range || '90d', as_of: ctx.query.as_of }) };
+  }],
+
+  /* ---- 省域地图（docs/59）：普通用户只读，匿名由服务端统一 401 ---- */
+  ['GET', '/api/v2/overview/region-map', async (ctx) => {
+    const g = readGuard();
+    if (g) return { status: g.status, body: g };
+    const out = regionMap.buildRegionMap(ctx.query || {});
+    if (out.error) return { status: out.status || 400, body: out };
+    return out;
+  }],
+
+  ['GET', '/api/v2/overview/region-map/export', async (ctx) => {
+    const g = readGuard();
+    if (g) return { status: g.status, body: g };
+    if (!ctx.user) return { status: 401, body: { error: '未认证' } };
+    const out = regionMap.buildRegionMapExport(ctx.query || {});
+    if (out.error) return { status: out.status || 400, body: out };
+    return exportResponse(ctx, {
+      dataset: out.dataset,
+      fileBase: out.fileBase,
+      format: fmt(ctx.query),
+      columns: out.columns,
+      rows: out.rows,
+      meta: out.meta,
+      filters: ctx.query,
+    });
   }],
 
   ['GET', '/api/v2/meta/metrics', async (ctx) => {

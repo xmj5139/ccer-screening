@@ -1,0 +1,8 @@
+{
+  "source_name": "阿里云DataV.GeoAtlas",
+  "source_url": "https://geo.datav.aliyun.com/areas_v3/bound/100000_full.json",
+  "homepage": "https://datav.aliyun.com/portal/school/atlas/area_selector",
+  "sha256": "99adfeded5223848bbe37a0a12f8023e11ee12161c7800521c27db42fdeac275",
+  "collected_at": "2026-10-19T09:51:29.066Z",
+  "note": "原始GeoJSON缓存；底图出处不代表自行取得新的地图审图号。"
+}

@@ -15,6 +15,11 @@ import * as contentSvc from './content-svc.mjs';
 import * as archiveSvc from './policy-archive-svc.mjs';
 import { notificationSettled } from './collect-svc.mjs';
 import { PUBLIC_RECON_FILTER } from './collect-svc.mjs';
+import {
+  STAGE_COLUMNS, STAGE_LABELS, aggregateProjectRows,
+} from './project-aggregate.mjs';
+
+export { STAGE_COLUMNS, STAGE_LABELS };
 
 /** 政策效力状态文案（正式与征求意见分开，草案不得当作现行正式文件） */
 const POLICY_STATUS_LABEL = {
@@ -96,24 +101,6 @@ function projectWhere(f, alias = 'p') {
   return { sql: `WHERE ${where.join(' AND ')}`, params };
 }
 
-export const STAGE_COLUMNS = {
-  project_public: 'stage_project_public',
-  validated: 'stage_validated',
-  project_registered: 'stage_project_registered',
-  reduction_public: 'stage_reduction_public',
-  verified: 'stage_verified',
-  reduction_registered: 'stage_reduction_registered',
-};
-
-export const STAGE_LABELS = {
-  project_public: '项目公示',
-  validated: '审定',
-  project_registered: '项目登记',
-  reduction_public: '减排量公示',
-  verified: '核查',
-  reduction_registered: '减排量登记',
-};
-
 /* ------------------------------------------------------------------ */
 /*  顶部指标                                                           */
 /* ------------------------------------------------------------------ */
@@ -139,17 +126,23 @@ export function topMetrics(f = parseFilters()) {
     "SELECT COUNT(*) AS c FROM policy_change WHERE review_status = 'pending'"
   )?.c ?? 0;
 
-  /* --- 项目（一律排除演示条目，业务口径与界面口径一致） --- */
+  /* --- 项目（一律排除演示条目，按登记号去重、阶段取并集） --- */
   const pw = projectWhere(f);
-  const projectStats = get(
-    `SELECT
-       COUNT(*) AS total,
-       SUM(stage_project_public) AS public_cnt,
-       SUM(stage_project_registered) AS registered_cnt,
-       SUM(stage_reduction_registered) AS reduction_registered_cnt
+  const projectRows = all(
+    `SELECT p.id, p.registry_project_no, p.name, p.province, p.methodology_id,
+            p.current_stage, p.updated_at,
+            p.stage_project_public, p.stage_validated, p.stage_project_registered,
+            p.stage_reduction_public, p.stage_verified, p.stage_reduction_registered
      FROM public_project p ${pw.sql}`,
     pw.params
-  ) || {};
+  );
+  const projectAgg = aggregateProjectRows(projectRows);
+  const projectStats = {
+    total: projectAgg.total,
+    public_cnt: projectAgg.stage_counts.project_public,
+    registered_cnt: projectAgg.stage_counts.project_registered,
+    reduction_registered_cnt: projectAgg.stage_counts.reduction_registered,
+  };
   const demoProjects = get(
     'SELECT COUNT(*) AS c FROM public_project WHERE COALESCE(is_demo,0)=1'
   )?.c ?? 0;
@@ -457,34 +450,28 @@ export function marketSeries({ range = '90d', as_of = todayCst(), trade_method =
 
 export function projectProgress(f = parseFilters()) {
   const pw = projectWhere(f);
-  const row = get(
-    `SELECT
-       SUM(stage_project_public) AS s1, SUM(stage_validated) AS s2,
-       SUM(stage_project_registered) AS s3, SUM(stage_reduction_public) AS s4,
-       SUM(stage_verified) AS s5, SUM(stage_reduction_registered) AS s6,
-       COUNT(*) AS total
+  const rows = all(
+    `SELECT p.id, p.registry_project_no, p.name, p.province, p.methodology_id,
+            p.current_stage, p.updated_at,
+            p.stage_project_public, p.stage_validated, p.stage_project_registered,
+            p.stage_reduction_public, p.stage_verified, p.stage_reduction_registered
      FROM public_project p ${pw.sql}`,
     pw.params
-  ) || {};
-  const stages = [
-    ['project_public', Number(row.s1 || 0)],
-    ['validated', Number(row.s2 || 0)],
-    ['project_registered', Number(row.s3 || 0)],
-    ['reduction_public', Number(row.s4 || 0)],
-    ['verified', Number(row.s5 || 0)],
-    ['reduction_registered', Number(row.s6 || 0)],
-  ].map(([key, count]) => ({
+  );
+  const agg = aggregateProjectRows(rows);
+  const stages = Object.entries(STAGE_LABELS).map(([key, label]) => ({
     stage: key,
-    label: STAGE_LABELS[key],
-    count,
+    label,
+    count: agg.stage_counts[key] || 0,
     drill: `#/projects?tab=public&stage=${key}`,
   }));
   return {
     stages,
-    project_total: Number(row.total || 0),
+    project_total: agg.total,
     note:
+      '项目总数按官方登记编号去重（缺失时按项目 ID），同一项目多行阶段标记取并集。' +
       '各阶段**不是互斥分类**：一个项目可以同时处于多个已完成阶段，因此各阶段数量**不能相加**，' +
-      '也不等于项目总数。项目总数单独统计。',
+      '也不等于项目总数。项目总数单独统计；原始收录记录数保留在项目库中。',
   };
 }
 

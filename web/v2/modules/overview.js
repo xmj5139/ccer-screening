@@ -6,9 +6,10 @@
  */
 import { api, setQuery, exportUrl, state } from '../app.js';
 import {
-  card, metricCard, comboChart, barChart, table, loading, emptyState, errorState, noteBlock,
+  card, metricCard, comboChart, barChart, loading, emptyState, errorState, noteBlock,
   num, pct, esc, shortDate, chip, drawer, renderKvRows, toast,} from '../ui.js';
 import { sourceBlock, sourceLinkBlock, summaryBlock, summaryCoverageHint, rangeSummaryBar, chatPanel, bindChatPanel } from '../platform.js';
+import { mountRegionMap } from './region-map.js';
 
 const RANGES = [
   { value: '30d', label: '近 30 天' },
@@ -24,12 +25,20 @@ export async function renderOverview(root) {
   let data;
   let cea = null;
   let accounting = null;
+  let regionMap = null;
   try {
     const qs = new URLSearchParams(Object.fromEntries(Object.entries(q).filter(([, v]) => v))).toString();
-    [data, cea] = await Promise.all([
+    const mapQs = new URLSearchParams();
+    for (const key of ['domain', 'methodology_id', 'stage']) {
+      if (q[key]) mapQs.set(key, q[key]);
+    }
+    [data, cea, regionMap] = await Promise.all([
       api(`/api/v2/overview${qs ? `?${qs}` : ''}`),
       // CEA 卡片失败不阻塞总览：如实显示空态与原因，不显示假数字
       api('/api/v2/cea/overview').catch((e) => ({ __error: e })),
+      // 省域地图失败不阻塞总览；地图自身会显示错误/降级省份列表
+      api(`/api/v2/overview/region-map${mapQs.toString() ? `?${mapQs.toString()}` : ''}`)
+        .catch((e) => ({ __error: e })),
     ]);
     // 碳核算公开资料卡同样失败不阻塞总览；取不到就留空态，不显示替代数字
     accounting = await api('/api/v2/accounting/status').catch((e) => ({ __error: e }));
@@ -76,6 +85,8 @@ export async function renderOverview(root) {
   ${filterHtml}
   <div class="metrics metrics-overview">${(data.metrics || []).map(metricCard).join('')}</div>
 
+  <div id="region-map-slot" class="region-map-slot-host"></div>
+
   <div class="grid-2">
     ${card({
       title: '市场走势',
@@ -101,31 +112,13 @@ export async function renderOverview(root) {
 
   ${accountingCard(accounting)}
 
-  <div class="grid-2">
-    ${card({
-      title: '方法学分布',
-      subtitle: `正式 ${data.methodology?.counts?.formal ?? 0} 项｜草案 ${data.methodology?.counts?.draft ?? 0} 项｜编号待核实 ${data.methodology?.counts?.code_pending ?? 0} 项`,
-      actions: '<a class="btn btn-sm" href="#/policies?tab=methodologies">进入方法学库</a>',
-      body: barChart({ items: (data.methodology?.by_domain || []).map((d) => ({ label: d.domain, count: d.total })), unit: ' 项' })
-        + noteBlock(data.methodology?.note),
-    })}
-    ${card({
-      title: '地域分布',
-      subtitle: '仅统计公开项目；同一项目在各阶段重复出现时不重复计入项目数',
-      actions: exportUrlLink('public-projects/export', 'xlsx', {}, '下载公开项目'),
-      body: table({
-        rows: (data.region?.provinces || []).slice(0, 8),
-        pageSize: 8,
-        columns: [
-          { key: 'province', label: '省份' },
-          { key: 'public_projects', label: '公开项目', align: 'right' },
-          { key: 'registered', label: '项目登记', align: 'right' },
-          { key: 'reduction_registered', label: '减排量登记', align: 'right' },
-        ],
-        emptyText: '尚无省份数据',
-      }) + noteBlock(data.region?.note),
-    })}
-  </div>
+  ${card({
+    title: '方法学分布',
+    subtitle: `正式 ${data.methodology?.counts?.formal ?? 0} 项｜草案 ${data.methodology?.counts?.draft ?? 0} 项｜编号待核实 ${data.methodology?.counts?.code_pending ?? 0} 项`,
+    actions: '<a class="btn btn-sm" href="#/policies?tab=methodologies">进入方法学库</a>',
+    body: barChart({ items: (data.methodology?.by_domain || []).map((d) => ({ label: d.domain, count: d.total })), unit: ' 项' })
+      + noteBlock(data.methodology?.note),
+  })}
 
   ${card({
     title: '最新政策与原文变化',
@@ -153,6 +146,24 @@ export async function renderOverview(root) {
     sel.addEventListener('change', () => setQuery({ [sel.dataset.f]: sel.value }));
   });
   root.querySelector('[data-reset]')?.addEventListener('click', () => setQuery({ range: null, domain: null, methodology_id: null, province: null, stage: null }));
+  // 省域地图：独立异步挂载，底图/接口失败不阻塞总览其他卡片。
+  // 地图只接收阶段/领域/方法学筛选；总览省份筛选仅作为上下文高亮，避免其他省全部消失。
+  const mapHost = root.querySelector('#region-map-slot');
+  if (mapHost) {
+    const stageLabel = (opts.stages || []).find((s) => s.key === q.stage)?.label || q.stage || null;
+    mountRegionMap({
+      root: mapHost,
+      initialData: regionMap,
+      filters: {
+        domain: q.domain || null,
+        methodology_id: q.methodology_id || null,
+        stage: q.stage || null,
+        stage_label: stageLabel,
+      },
+      contextProvince: q.province || null,
+      fetchApi: api,
+    });
+  }
   // 总览底部 AI 对话区（所有已登录用户可用；历史仅保存在内存）
   bindChatPanel(root);
   root.addEventListener('click', async (e) => {

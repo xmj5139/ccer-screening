@@ -64,6 +64,7 @@ const CEA_SCHEMA_FILE = 'schema-cea.sql';
 const ACCOUNTING_SCHEMA_FILE = 'schema-accounting.sql';
 const PLATFORM_SCHEMA_FILE = 'schema-platform.sql';
 const DEEPSEEK_SCHEMA_FILE = 'schema-deepseek.sql';
+const REGIONAL_SCHEMA_FILE = 'schema-regional.sql';
 
 export function migrate(db) {
   const sql = readFileSync(join(__dirname, '..', 'db', 'schema.sql'), 'utf8');
@@ -207,6 +208,17 @@ export function migrate(db) {
     if (!getMeta(db, 'schema_version_deepseek_applied')) {
       setMeta(db, 'schema_version_deepseek_applied', nowIso());
       setMeta(db, 'schema_version', '2.7.0');
+    }
+  }
+
+  // ---- v2.7 省域地图增量（docs/59）----
+  // 省级排放记录与项目/名录分表保存，纯新增表；版本号保持 2.7.0，不另发标签。
+  // 重复执行 CREATE ... IF NOT EXISTS / CREATE INDEX ... IF NOT EXISTS 安全。
+  const regionalPath = join(__dirname, '..', 'db', REGIONAL_SCHEMA_FILE);
+  if (existsSync(regionalPath)) {
+    db.exec(readFileSync(regionalPath, 'utf8'));
+    if (!getMeta(db, 'schema_version_regional_applied')) {
+      setMeta(db, 'schema_version_regional_applied', nowIso());
     }
   }
 

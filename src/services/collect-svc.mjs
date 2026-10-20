@@ -1337,6 +1337,19 @@ export async function runDailyJob(opts = {}) {
       detail.accounting = { ok: false, error: e.message };
       stats.errors += 1;
     }
+    // 省域排放（docs/61）：从固定公开源有界采集，await 并隔离错误。
+    // 失败保留已有值；原件 hash 相同只记 last_check，不造无意义修订。
+    try {
+      const regionalCollect = await import('./regional-collect-svc.mjs');
+      detail.region_map = await regionalCollect.runRegionalDailyCollect({
+        actor: 'system:daily-regional',
+        trigger: trigger === 'schedule' ? 'schedule' : 'manual',
+      });
+      if (detail.region_map?.ok === false) stats.errors += 1;
+    } catch (e) {
+      stats.errors += 1;
+      detail.region_map = { ok: false, status: 'failed', error: e.message };
+    }
     // 统一模型核验：内容（研报/动态）+ 政策 + 方法学 + 公开项目，共用同一套四态与缓存键。
     // unavailable 不缓存：模型配置好之后同一内容会在此自动重试。
     if (datasets.includes('verify')) {

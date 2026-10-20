@@ -36,6 +36,8 @@ export const V2_REQUIRED_TABLES = [
   'content_item', 'content_version', 'content_source_link',
   'search_provider', 'web_fetch_connection',
   'verification_result', 'auto_verify_rule', 'auto_verify_config', 'dataset_cursor',
+  // v2.7 省域地图（docs/59）
+  'region_emission',
 ];
 
 /** 生产（在用）数据库的规范路径：任何 v2 命令都不允许指向它 */
