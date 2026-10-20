@@ -30,7 +30,8 @@ const MAX_VALUE_TCO2 = 1e12; // 省级单年 CO₂ 远低于此值；仅用于�
 
 export const PROJECT_METRICS = ['projects', 'registered_projects', 'reduction_registered_projects'];
 export const EMISSION_METRICS = ['region_co2', 'national_ets'];
-export const METRICS = [...PROJECT_METRICS, ...EMISSION_METRICS];
+export const DIRECTORY_METRICS = ['ets_entities'];
+export const METRICS = [...PROJECT_METRICS, ...EMISSION_METRICS, ...DIRECTORY_METRICS];
 
 export const METRIC_META = {
   projects: {
@@ -53,12 +54,17 @@ export const METRIC_META = {
     key: 'national_ets', view: 'national_ets', label: '全国碳市场纳管排放', unit: 'tCO2',
     scope: 'national_ets',
   },
+  ets_entities: {
+    key: 'ets_entities', view: 'ets_entities', label: 'CEA纳管企业名录', unit: '家',
+    scope: 'cea_entity', value_key: 'directory_count',
+  },
 };
 
 export const VIEWS = [
   { key: 'projects', label: '公开 CCER 项目', metrics: PROJECT_METRICS },
   { key: 'region_co2', label: '区域 CO₂ 排放', metrics: ['region_co2'] },
   { key: 'national_ets', label: '全国碳市场纳管排放', metrics: ['national_ets'] },
+  { key: 'ets_entities', label: 'CEA纳管企业名录', metrics: DIRECTORY_METRICS },
 ];
 
 export const SUBMETRICS = PROJECT_METRICS.map((key) => ({
@@ -79,7 +85,7 @@ export const CCER_PROJECT_SOURCE = {
 };
 
 const ALLOWED_QUERY_KEYS = new Set([
-  'metric', 'year', 'region', 'domain', 'methodology_id', 'stage', 'dataset',
+  'metric', 'year', 'list_year', 'region', 'domain', 'methodology_id', 'stage', 'dataset',
 ]);
 const EXPORT_QUERY_KEYS = new Set([...ALLOWED_QUERY_KEYS, 'format']);
 const IMPORT_KEYS = new Set([
@@ -249,6 +255,27 @@ export function formatProjectCount(value) {
   return `${Number(value).toLocaleString('zh-CN')} 个`;
 }
 
+export function formatEntityCount(value) {
+  if (value === null || value === undefined || !Number.isFinite(Number(value))) return '—';
+  return `${Number(value).toLocaleString('zh-CN')} 家`;
+}
+
+export function formatListYear(value) {
+  const n = Number(value);
+  return Number.isInteger(n) && n > 0 ? `${n} 年` : '名录年度未取得';
+}
+
+const NATIONAL_ETS_SECTORS = ['发电', '钢铁', '水泥', '铝冶炼'];
+const DIRECTORY_SCOPE_NOTE =
+  '本平台已收录，非全国/全省完整数量；行业覆盖以各省详情为准，未取得出处的行业不补 0，也不代表不存在。';
+
+function splitSectors(value) {
+  return String(value || '')
+    .split(/[、,，;；/]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
 function dateOnly(s) {
   const v = textValue(s);
   if (!v) return null;
@@ -292,6 +319,7 @@ export function validateRegionMapQuery(query = {}, { allowFormat = false } = {})
     };
   }
   const isProject = PROJECT_METRICS.includes(metric);
+  const isDirectory = DIRECTORY_METRICS.includes(metric);
   const yearText = textValue(query.year);
   let year = null;
   if (yearText !== null) {
@@ -310,6 +338,35 @@ export function validateRegionMapQuery(query = {}, { allowFormat = false } = {})
         ok: false, status: 400,
         error: '公开项目指标是当前收录快照，不使用 year 过滤；排放视图才按年度选择',
         parameter: 'year',
+      };
+    }
+    if (isDirectory) {
+      return {
+        ok: false, status: 400,
+        error: '名录视图按 list_year 选择名录年度，不借用排放年度 year',
+        parameter: 'year',
+      };
+    }
+  }
+
+  const listYearText = textValue(query.list_year);
+  let listYear = null;
+  if (listYearText !== null) {
+    if (!/^\d{4}$/.test(listYearText)) {
+      return { ok: false, status: 400, error: 'list_year 必须是四位年份', parameter: 'list_year' };
+    }
+    listYear = Number(listYearText);
+    if (!Number.isInteger(listYear) || listYear < 2000 || listYear > CURRENT_YEAR + 1) {
+      return {
+        ok: false, status: 400, error: `list_year 必须在 2000–${CURRENT_YEAR + 1} 之间`,
+        parameter: 'list_year',
+      };
+    }
+    if (!isDirectory) {
+      return {
+        ok: false, status: 400,
+        error: 'list_year 只用于 CEA 纳管企业名录视图；排放视图请使用 year',
+        parameter: 'list_year',
       };
     }
   }
@@ -347,6 +404,13 @@ export function validateRegionMapQuery(query = {}, { allowFormat = false } = {})
         parameter: 'dataset',
       };
     }
+    if (isDirectory) {
+      return {
+        ok: false, status: 400,
+        error: '名录视图不使用 dataset；名录年度请使用 list_year',
+        parameter: 'dataset',
+      };
+    }
   }
   let format = null;
   if (allowFormat) {
@@ -358,7 +422,7 @@ export function validateRegionMapQuery(query = {}, { allowFormat = false } = {})
   return {
     ok: true,
     value: {
-      metric, view: METRIC_META[metric].view, year, region: region || null,
+      metric, view: METRIC_META[metric].view, year, list_year: listYear, region: region || null,
       domain: domain || null, methodology_id: methodologyId || null,
       stage: stage || null, dataset: dataset || null, format,
     },
@@ -514,101 +578,265 @@ function projectAggregates(f) {
 /*  四、全国碳市场名录聚合（按年度、企业去重）                            */
 /* ==================================================================== */
 
-function directoryAggregates() {
+function emptyDirectoryAggregates(error = null, extra = {}) {
+  return {
+    available: false,
+    years: [],
+    latest_year: null,
+    selected_year: null,
+    by_year: new Map(),
+    all_years: new Map(),
+    label_counts: new Map(),
+    unknown: [],
+    unknown_by_year: new Map(),
+    source_sets: new Map(),
+    source_meta: new Map(),
+    source_as_of: new Map(),
+    sector_sets: new Map(),
+    as_of_by_year_province: new Map(),
+    total_latest_year: null,
+    total_selected_year: null,
+    total_all_years: null,
+    as_of: null,
+    latest_as_of: null,
+    sources: [],
+    error,
+    ...extra,
+  };
+}
+
+/**
+ * 全国碳市场名录聚合。
+ * 去重键优先使用统一社会信用代码，未披露时退回 entity_key/名称；只在“信用代码+名录年度”内去重，
+ * 同一主体跨行业/多出处只计 1 家。省份无记录时 count=null，不补 0。
+ */
+function directoryAggregates(requestedYear = null) {
   let rows = [];
   try {
     rows = all(
-      `SELECT province, entity_key, list_year, data_as_of, source_url, updated_at
+      `SELECT id, entity_key, credit_code, name, province, sector, list_year,
+              data_as_of, source_url, source_code, updated_at
        FROM cea_entity`
     );
   } catch (e) {
-    return {
-      available: false,
-      years: [],
-      latest_year: null,
-      by_year: new Map(),
-      all_years: new Map(),
-      label_counts: new Map(),
-      unknown: [],
-      total_latest_year: null,
-      total_all_years: null,
-      as_of: null,
-      source: null,
-      error: e.message,
-    };
+    return emptyDirectoryAggregates(e.message);
   }
-  if (!rows.length) {
-    return {
-      available: false,
-      years: [],
-      latest_year: null,
-      by_year: new Map(),
-      all_years: new Map(),
-      label_counts: new Map(),
-      unknown: [],
-      total_latest_year: null,
-      total_all_years: null,
-      as_of: null,
-      source: null,
-      error: null,
-    };
+  if (!rows.length) return emptyDirectoryAggregates();
+  const years = [...new Set(rows.map((r) => Number(r.list_year)).filter((y) => Number.isInteger(y)))]
+    .sort((a, b) => b - a);
+  if (!years.length) return emptyDirectoryAggregates();
+  const selectedYear = requestedYear === null || requestedYear === undefined
+    ? years[0] : Number(requestedYear);
+  if (!years.includes(selectedYear)) {
+    return emptyDirectoryAggregates(
+      `未收录 ${requestedYear} 年名录；可选名录年度：${years.join('、')}。`,
+      {
+        status: 400, years, latest_year: years[0], selected_year: null,
+        total_latest_year: null, total_selected_year: null, total_all_years: null,
+      }
+    );
   }
-  const years = [...new Set(rows.map((r) => Number(r.list_year)).filter((y) => Number.isInteger(y)))].sort((a, b) => b - a);
-  const latestYear = years[0] ?? null;
+
+  // 成员关系表保存同一主体在各官方名单中的行业/出处；老库缺失该表时退回主体行字段。
+  let memberships = [];
+  try {
+    memberships = all(
+      `SELECT entity_id, source_code, source_url, sector
+       FROM cea_entity_membership`
+    );
+  } catch {
+    memberships = [];
+  }
+  const membershipsByEntity = new Map();
+  for (const m of memberships) {
+    if (!membershipsByEntity.has(m.entity_id)) membershipsByEntity.set(m.entity_id, []);
+    membershipsByEntity.get(m.entity_id).push(m);
+  }
+
   const byYear = new Map();
   const allYears = new Map();
   const labelCounts = new Map();
-  const unknown = new Map();
-  let asOf = null;
-  let source = null;
+  const unknownAll = new Map();
+  const unknownByYear = new Map();
+  const sourceSets = new Map();
+  const sourceMeta = new Map();
+  const sourceAsOf = new Map();
+  const sectorSets = new Map();
+  const asOfByYearProvince = new Map();
+
+  const addSource = (yearKey, sourceKey, key, day, code, url) => {
+    if (!sourceMeta.has(sourceKey)) sourceMeta.set(sourceKey, { source_code: code || null, source_url: url || null });
+    const meta = sourceMeta.get(sourceKey);
+    if (!meta.source_url && url) meta.source_url = url;
+    if (!sourceSets.has(yearKey)) sourceSets.set(yearKey, new Map());
+    const map = sourceSets.get(yearKey);
+    if (!map.has(sourceKey)) map.set(sourceKey, new Set());
+    map.get(sourceKey).add(key);
+    if (day) {
+      const asOfKey = `${yearKey}|${sourceKey}`;
+      if (!sourceAsOf.has(asOfKey) || day > sourceAsOf.get(asOfKey)) sourceAsOf.set(asOfKey, day);
+    }
+  };
+
   for (const row of rows) {
+    const year = Number(row.list_year);
+    if (!Number.isInteger(year) || !years.includes(year)) continue;
     const province = normalizeProvince(row.province);
-    const key = String(row.entity_key || '').trim();
+    const creditCode = String(row.credit_code || '').trim().toUpperCase();
+    const key = creditCode
+      || String(row.entity_key || '').trim()
+      || `name:${String(row.name || '').trim()}`;
     if (!key) continue;
-    if (province) {
-      const allKey = province.code;
-      if (!allYears.has(allKey)) allYears.set(allKey, new Set());
-      allYears.get(allKey).add(key);
-      if (!labelCounts.has(allKey)) labelCounts.set(allKey, new Map());
-      const raw = String(row.province || '').trim();
-      if (raw) labelCounts.get(allKey).set(raw, (labelCounts.get(allKey).get(raw) || 0) + 1);
-      const yearKey = `${Number(row.list_year)}|${province.code}`;
-      if (!byYear.has(yearKey)) byYear.set(yearKey, new Set());
-      byYear.get(yearKey).add(key);
-    } else {
+    const yearKeyBase = `${year}|${province ? province.code : ''}`;
+    const day = dateOnly(row.data_as_of) || dateOnly(row.updated_at);
+    if (!province) {
       const label = String(row.province || '').trim() || '未标注省份';
-      if (!unknown.has(label)) unknown.set(label, new Set());
-      unknown.get(label).add(key);
+      if (!unknownAll.has(label)) unknownAll.set(label, new Set());
+      unknownAll.get(label).add(key);
+      if (!unknownByYear.has(year)) unknownByYear.set(year, new Map());
+      const map = unknownByYear.get(year);
+      if (!map.has(label)) map.set(label, new Set());
+      map.get(label).add(key);
+      continue;
     }
-    if (Number(row.list_year) === latestYear) {
-      const day = dateOnly(row.data_as_of) || dateOnly(row.updated_at);
-      if (day && (!asOf || day > asOf)) asOf = day;
-      const url = safeHttpUrl(row.source_url);
-      if (url) source = { source_url: url, data_as_of: dateOnly(row.data_as_of) };
+    const code = province.code;
+    if (!allYears.has(code)) allYears.set(code, new Set());
+    allYears.get(code).add(key);
+    if (!labelCounts.has(code)) labelCounts.set(code, new Map());
+    const rawLabel = String(row.province || '').trim();
+    if (rawLabel) labelCounts.get(code).set(rawLabel, (labelCounts.get(code).get(rawLabel) || 0) + 1);
+    if (!byYear.has(yearKeyBase)) byYear.set(yearKeyBase, new Set());
+    byYear.get(yearKeyBase).add(key);
+    if (!sectorSets.has(yearKeyBase)) sectorSets.set(yearKeyBase, new Set());
+    const memberRows = membershipsByEntity.get(row.id) || [];
+    const sectors = new Set(sectorSets.get(yearKeyBase));
+    for (const m of memberRows) for (const s of splitSectors(m.sector)) sectors.add(s);
+    if (!sectors.size) for (const s of splitSectors(row.sector)) sectors.add(s);
+    sectorSets.set(yearKeyBase, sectors);
+    if (day && (!asOfByYearProvince.has(yearKeyBase) || day > asOfByYearProvince.get(yearKeyBase))) {
+      asOfByYearProvince.set(yearKeyBase, day);
+    }
+    const refs = memberRows.length
+      ? memberRows.map((m) => ({ source_code: m.source_code, source_url: m.source_url }))
+      : [{ source_code: row.source_code, source_url: row.source_url }];
+    const seenRefs = new Set();
+    for (const ref of refs) {
+      const sourceCode = String(ref.source_code || '').trim();
+      const sourceUrl = safeHttpUrl(ref.source_url);
+      if (!sourceCode && !sourceUrl) continue;
+      // 以实际链接作为出处标识，确保同一代码下不同官方文件不会被合并掉。
+      const sourceKey = sourceUrl ? `url:${sourceUrl}` : `code:${sourceCode}`;
+      if (seenRefs.has(sourceKey)) continue;
+      seenRefs.add(sourceKey);
+      addSource(yearKeyBase, sourceKey, key, day, sourceCode, sourceUrl);
     }
   }
-  const latestByCode = new Map();
+
+  let totalSelected = 0;
+  for (const p of PROVINCES) totalSelected += byYear.get(`${selectedYear}|${p.code}`)?.size || 0;
   let totalLatest = 0;
-  for (const [code, set] of allYears.entries()) {
-    latestByCode.set(code, set.size);
-  }
+  for (const p of PROVINCES) totalLatest += byYear.get(`${years[0]}|${p.code}`)?.size || 0;
+  const allYearsCount = new Map([...allYears.entries()].map(([code, set]) => [code, set.size]));
+  const totalAll = [...allYears.values()].reduce((sum, set) => sum + set.size, 0);
+  const unknown = [...unknownAll.entries()].map(([province, set]) => ({ province, count: set.size }));
+  const selectedUnknown = [...(unknownByYear.get(selectedYear) || new Map()).entries()]
+    .map(([province, set]) => ({ province, count: set.size }));
+
+  // 全部省级出处汇总（当前名录年度）；不下沉为“最后一条全库来源”。
+  const selectedSourceSets = new Map();
   for (const p of PROVINCES) {
-    totalLatest += byYear.get(`${latestYear}|${p.code}`)?.size || 0;
+    const map = sourceSets.get(`${selectedYear}|${p.code}`);
+    if (!map) continue;
+    for (const [sourceKey, keys] of map.entries()) {
+      if (!selectedSourceSets.has(sourceKey)) selectedSourceSets.set(sourceKey, new Set());
+      for (const key of keys) selectedSourceSets.get(sourceKey).add(`${p.code}|${key}`);
+    }
   }
-  const totalAll = [...allYears.values()].reduce((s, set) => s + set.size, 0);
+  const sources = [...selectedSourceSets.entries()].map(([sourceKey, keys]) => {
+    const meta = sourceMeta.get(sourceKey) || {};
+    const asOf = sourceAsOf.get(`${selectedYear}|${sourceKey}`) || null;
+    return {
+      source_code: meta.source_code || null,
+      source_url: meta.source_url || null,
+      count: keys.size,
+      as_of: asOf,
+    };
+  }).sort((a, b) => b.count - a.count || String(a.source_code || a.source_url).localeCompare(String(b.source_code || b.source_url)));
+
+  const selectedAsOf = PROVINCES.reduce((max, p) => {
+    const day = asOfByYearProvince.get(`${selectedYear}|${p.code}`);
+    return day && (!max || day > max) ? day : max;
+  }, null);
+  const latestAsOf = PROVINCES.reduce((max, p) => {
+    const day = asOfByYearProvince.get(`${years[0]}|${p.code}`);
+    return day && (!max || day > max) ? day : max;
+  }, null);
+
   return {
     available: true,
     years,
-    latest_year: latestYear,
+    latest_year: years[0],
+    selected_year: selectedYear,
     by_year: byYear,
-    all_years: latestByCode,
+    all_years: allYearsCount,
     label_counts: labelCounts,
-    unknown: [...unknown.entries()].map(([province, set]) => ({ province, count: set.size })),
+    unknown,
+    unknown_by_year: unknownByYear,
+    selected_unknown: selectedUnknown,
+    source_sets: sourceSets,
+    source_meta: sourceMeta,
+    source_as_of: sourceAsOf,
+    sector_sets: sectorSets,
+    as_of_by_year_province: asOfByYearProvince,
     total_latest_year: totalLatest,
+    total_selected_year: totalSelected,
     total_all_years: totalAll,
-    as_of: asOf,
-    source,
+    as_of: selectedAsOf,
+    latest_as_of: latestAsOf,
+    sources,
     error: null,
+  };
+}
+
+function directoryRegionDetail(directory, province) {
+  const year = directory.selected_year;
+  const key = year && province ? `${year}|${province.code}` : '';
+  const set = key ? directory.by_year.get(key) : null;
+  const count = set ? set.size : null;
+  const sourceMap = key ? directory.source_sets.get(key) : null;
+  const sources = sourceMap ? [...sourceMap.entries()].map(([sourceKey, keys]) => {
+    const meta = directory.source_meta.get(sourceKey) || {};
+    return {
+      source_code: meta.source_code || null,
+      source_url: meta.source_url || null,
+      count: keys.size,
+      as_of: directory.source_as_of.get(`${key}|${sourceKey}`) || null,
+    };
+  }).sort((a, b) => b.count - a.count || String(a.source_code || a.source_url).localeCompare(String(b.source_code || b.source_url))) : [];
+  const sectors = [...(key ? directory.sector_sets.get(key) || [] : [])];
+  const missingSectors = NATIONAL_ETS_SECTORS.filter((s) => !sectors.includes(s));
+  const asOf = key ? directory.as_of_by_year_province.get(key) || null : null;
+  const note = count === null || count === 0
+    ? `本平台尚未收录该省 ${year || ''} 年名录；不补 0，不代表该省没有重点排放单位。`
+    : `本平台已收录该省 ${year} 年名录 ${count} 家；`
+      + (missingSectors.length
+        ? `仅取得${sectors.length ? sectors.join('、') : '未标注'}行业名单；${missingSectors.join('、')}行业名单尚未取得；`
+        : `已取得${sectors.join('、')}行业名单；`)
+      + '不代表全省或全国完整数量。';
+  return {
+    available: Boolean(year && count !== null),
+    year,
+    list_year: year,
+    count,
+    all_years_count: directory.all_years.get(province.code) || 0,
+    sources,
+    source_count: sources.length,
+    sectors,
+    missing_sectors: missingSectors,
+    as_of: asOf,
+    province_label: province.name,
+    coverage_note: note,
+    note,
   };
 }
 
@@ -890,7 +1118,7 @@ function mostCommonLabel(counts) {
     .sort((a, b) => b[1] - a[1] || String(a[0]).localeCompare(String(b[0]), 'zh-CN'))[0][0];
 }
 
-function buildNotes(metric, emission) {
+function buildNotes(metric, emission, directory, directoryCoverageNote = DIRECTORY_SCOPE_NOTE) {
   const notes = [
     '项目数按本平台已收录公开项目统计，按官方登记编号去重（缺失时按项目 ID），排除 demo 条目；'
       + '0 表示本系统未收录，不代表该省没有项目。',
@@ -899,6 +1127,17 @@ function buildNotes(metric, emission) {
     '省份选择只控制右侧详情与跳转，不改变全国底图；总览省份筛选在卡片上单独标注。',
     '未知省份单列，不按项目名称或城市名猜省份。',
   ];
+  if (DIRECTORY_METRICS.includes(metric)) {
+    notes.push(
+      'CEA 纳管企业名录来自 cea_entity，按统一社会信用代码 + 名录年度去重；'
+        + '未披露信用代码的条目按名称参与去重，同一主体多行业/多出处只计 1 家。',
+      '未收录省份保持 null（灰色斜纹），不补 0；0 不表示该省真实没有重点排放单位。',
+      '名录只表示本平台已收录的公开名单，不是企业排放量、配额缺口、买家数量或企业盈缺。',
+      `名录年度:${directory?.selected_year ?? '未取得'}；名录采集截止日单独列示，不借用排放日期。`,
+      directoryCoverageNote,
+      '项目阶段/领域/方法学筛选只影响项目数，不改变名录企业数。',
+    );
+  }
   if (EMISSION_METRICS.includes(metric)) {
     notes.push(
       '排放底层值为 tCO2；万吨/亿吨是展示换算（1 亿吨 = 100,000,000 吨），不与 tCO2e 混算。',
@@ -925,9 +1164,21 @@ export function buildRegionMap(query = {}) {
   const memberError = validateFilterValues(f);
   if (memberError) return memberError;
 
+  const isProject = PROJECT_METRICS.includes(f.metric);
+  const isDirectory = DIRECTORY_METRICS.includes(f.metric);
+  const isEmission = EMISSION_METRICS.includes(f.metric);
   const projects = projectAggregates(f);
-  const directory = directoryAggregates();
-  const emission = EMISSION_METRICS.includes(f.metric) ? emissionAggregates(f) : null;
+  const directory = directoryAggregates(isDirectory ? f.list_year : null);
+  if (isDirectory && directory.error) {
+    return {
+      ...directory,
+      status: directory.status || 400,
+      filters: f,
+      list_year_options: directory.years || [],
+      data_available: false,
+    };
+  }
+  const emission = isEmission ? emissionAggregates(f) : null;
   if (emission?.error) {
     return {
       ...emission,
@@ -937,9 +1188,10 @@ export function buildRegionMap(query = {}) {
     };
   }
 
-  const isProject = PROJECT_METRICS.includes(f.metric);
   const meta = METRIC_META[f.metric];
   const projectSource = sourceForProject(projects);
+  const directoryYear = isDirectory ? directory.selected_year : directory.latest_year;
+  const directoryAsOf = isDirectory ? directory.as_of : directory.latest_as_of;
   const regions = regionCatalog().map((p) => {
     const pAgg = projects.byCode.get(p.code);
     const projValue = isProject ? pAgg[meta.value_key] : null;
@@ -948,11 +1200,26 @@ export function buildRegionMap(query = {}) {
     let missing = false;
     let emissionRow = null;
     let source = null;
+    const dirDetail = directoryRegionDetail(directory, p);
     if (isProject) {
       value = Number(projValue);
       display = formatProjectCount(value);
       missing = false;
       source = projectSource;
+    } else if (isDirectory) {
+      value = dirDetail.count;
+      display = value === null ? '未收录' : formatEntityCount(value);
+      missing = value === null;
+      source = dirDetail.sources.length ? {
+        source_name: `省级生态环境主管部门公开名录（${dirDetail.sources.length} 份）`,
+        source_url: dirDetail.sources[0]?.source_url || null,
+        source_kind: 'official',
+        source_kind_label: '官方公开名录',
+        methodology: '按统一社会信用代码 + 名录年度去重',
+        boundary: '本平台已收录，非全国/全省完整数量',
+        verification_status: 'source_recorded',
+        excerpt: dirDetail.coverage_note,
+      } : null;
     } else {
       emissionRow = emission.records.get(p.code) || null;
       if (emissionRow && emissionRow.value_tco2 !== null && emissionRow.value_tco2 !== undefined) {
@@ -967,12 +1234,10 @@ export function buildRegionMap(query = {}) {
         source = null;
       }
     }
-    const directoryYear = directory.available ? directory.latest_year : null;
-    const directoryCount = directory.available && directoryYear
-      ? (directory.by_year.get(`${directoryYear}|${p.code}`)?.size || 0)
-      : null;
+    const directoryCountForView = isDirectory
+      ? dirDetail.count
+      : (dirDetail.available ? (dirDetail.count || 0) : null);
     const projectProvinceLabel = mostCommonLabel(projects.labelCounts.get(p.code));
-    const directoryProvinceLabel = mostCommonLabel(directory.label_counts?.get(p.code));
     return {
       code: p.code,
       name: p.name,
@@ -988,11 +1253,23 @@ export function buildRegionMap(query = {}) {
       registered_count: pAgg.registered_count,
       reduction_registered_count: pAgg.reduction_registered_count,
       ets_directory: {
-        available: Boolean(directory.available && directoryYear),
+        available: isDirectory
+          ? dirDetail.available
+          : Boolean(directory.available && directoryYear),
         year: directoryYear,
-        count: directoryCount,
+        count: directoryCountForView,
         all_years_count: directory.available ? (directory.all_years.get(p.code) || 0) : null,
-        province_label: directoryProvinceLabel,
+        province_label: p.name,
+        sources: dirDetail.sources,
+        source_count: dirDetail.source_count,
+        sectors: dirDetail.sectors,
+        missing_sectors: dirDetail.missing_sectors,
+        as_of: dirDetail.as_of,
+        coverage_note: dirDetail.coverage_note,
+      },
+      directory: {
+        ...dirDetail,
+        list_year: directoryYear,
       },
       emission: emissionRow ? {
         value_tco2: Number(emissionRow.value_tco2),
@@ -1010,15 +1287,43 @@ export function buildRegionMap(query = {}) {
     };
   });
 
+  const directoryGapNotes = regions
+    .filter((r) => r.directory?.sectors?.length && r.directory?.missing_sectors?.length)
+    .map((r) => `${r.name}仅取得${r.directory.sectors.join('、')}行业名单`)
+    .slice(0, 8);
+  const directoryCoverageNote = `${DIRECTORY_SCOPE_NOTE}`
+    + (directoryGapNotes.length ? `当前明确缺口：${directoryGapNotes.join('；')}。` : '');
   const covered = regions.filter((r) => !r.missing);
   const missingRegions = regions.filter((r) => r.missing).length;
   const total = covered.length ? covered.reduce((s, r) => s + Number(r.value || 0), 0) : null;
-  const projectTotal = PROJECT_METRICS.includes(f.metric)
+  const projectTotal = isProject
     ? regions.reduce((s, r) => s + Number(r[meta.value_key] || 0), 0)
     : null;
   const unknownProjects = projects.unknown.reduce((s, u) => s + u.project_count, 0);
   const totalValue = isProject ? projectTotal : total;
-  const directoryTotal = directory.available ? directory.total_latest_year : null;
+  const directoryTotal = directory.available
+    ? (isDirectory ? directory.total_selected_year : directory.total_latest_year)
+    : null;
+  const directoryCovered = regions.filter((r) => Number(r.directory?.count) > 0).length;
+  const unknownDirectory = isDirectory
+    ? (directory.selected_unknown || [])
+    : (directory.unknown || []);
+  const directorySourceSummary = {
+    source_name: '省级生态环境主管部门公开名录',
+    source_url: directory.sources?.[0]?.source_url || null,
+    source_kind: 'official',
+    source_kind_label: '官方公开名录',
+    verification_status: 'source_recorded',
+    data_as_of: directoryAsOf,
+    source_count: directory.sources?.length || 0,
+    sources: directory.sources || [],
+    excerpt: directoryCoverageNote,
+  };
+  const filtersNote = isDirectory
+    ? '项目阶段/领域/方法学筛选只影响项目统计，不改变名录企业数。'
+    : isEmission
+      ? '项目筛选（阶段/领域/方法学）只作用于项目数与名录联动，不改变已入库的排放记录口径。'
+      : '筛选条件已传递到公开项目统计。';
 
   return {
     metric: f.metric,
@@ -1026,23 +1331,27 @@ export function buildRegionMap(query = {}) {
     view: meta.view,
     scope: meta.scope,
     unit: meta.unit,
-    year: isProject ? null : emission.year,
-    year_options: isProject ? [] : (emission.year_options || []),
-    dataset: isProject ? null : emission.dataset,
-    dataset_options: isProject ? [] : (emission.datasets || []),
+    year: isEmission ? emission.year : null,
+    year_options: isEmission ? (emission.year_options || []) : [],
+    list_year: directoryYear,
+    list_year_options: directory.years || [],
+    dataset: isEmission ? emission.dataset : null,
+    dataset_options: isEmission ? (emission.datasets || []) : [],
     region: f.region,
     filters: {
       domain: f.domain,
       methodology_id: f.methodology_id,
       stage: f.stage,
-      note: EMISSION_METRICS.includes(f.metric)
-        ? '项目筛选（阶段/领域/方法学）只作用于项目数与名录联动，不改变已入库的排放记录口径。'
-        : '筛选条件已传递到公开项目统计。',
+      note: filtersNote,
     },
     views: VIEWS,
     submetrics: SUBMETRICS,
-    data_available: isProject ? true : Boolean(emission.available),
-    message: isProject ? null : emission.message,
+    data_available: isProject ? true : (isDirectory ? Boolean(directory.available) : Boolean(emission.available)),
+    message: isProject
+      ? null
+      : isDirectory
+        ? (directory.available ? null : '尚未收录 CEA 纳管企业名录；不补 0，不生成演示热力。')
+        : emission.message,
     regions,
     unknown: {
       projects: {
@@ -1053,9 +1362,9 @@ export function buildRegionMap(query = {}) {
           : null,
       },
       directory: {
-        count: directory.unknown.reduce((s, u) => s + u.count, 0),
-        items: directory.unknown,
-        note: directory.unknown.length
+        count: unknownDirectory.reduce((s, u) => s + u.count, 0),
+        items: unknownDirectory,
+        note: unknownDirectory.length
           ? '名录中的省份文本无法归并，未计入 34 地区。'
           : null,
       },
@@ -1065,36 +1374,59 @@ export function buildRegionMap(query = {}) {
       covered_regions: covered.length,
       missing_regions: missingRegions,
       value: totalValue,
-      display: isProject ? formatProjectCount(totalValue) : (totalValue === null ? '—' : formatTco2(totalValue)),
+      display: isProject
+        ? formatProjectCount(totalValue)
+        : isDirectory
+          ? formatEntityCount(totalValue)
+          : (totalValue === null ? '—' : formatTco2(totalValue)),
       label: isProject
         ? `本系统已收录${meta.label}合计（34 地区）`
-        : `已披露合计（${covered.length}/34 省，非全国排放总量）`,
+        : isDirectory
+          ? `本平台已收录名录合计（${covered.length}/34 省，非全国/全省完整数量）`
+          : `已披露合计（${covered.length}/34 省，非全国排放总量）`,
       project_count: regions.reduce((s, r) => s + r.project_count, 0),
       registered_count: regions.reduce((s, r) => s + r.registered_count, 0),
       reduction_registered_count: regions.reduce((s, r) => s + r.reduction_registered_count, 0),
       unknown_projects: unknownProjects,
       directory_total: directoryTotal,
-      directory_year: directory.available ? directory.latest_year : null,
+      directory_year: directoryYear,
       directory_total_all_years: directory.available ? directory.total_all_years : null,
+      directory_covered_regions: directoryCovered,
     },
     coverage: {
       // 排放截至只来自排放记录；名录采集日期单独放在 directory_as_of，不互相借用。
-      as_of: isProject ? projects.as_of : (emission.coverage?.as_of || null),
+      as_of: isProject
+        ? projects.as_of
+        : isDirectory
+          ? directoryAsOf
+          : (emission.coverage?.as_of || null),
       project_as_of: projects.as_of,
-      emission_as_of: emission?.coverage?.as_of || null,
-      emission_published_latest: emission?.coverage?.published_latest || null,
-      directory_as_of: directory.as_of,
+      emission_as_of: isEmission ? (emission.coverage?.as_of || null) : null,
+      emission_published_latest: isEmission ? (emission.coverage?.published_latest || null) : null,
+      directory_as_of: directoryAsOf,
       project_scope: CCER_PROJECT_SOURCE.boundary,
-      emission_scope: emission?.coverage
+      emission_scope: isEmission && emission.coverage
         ? `${sourceKindLabel(emission.coverage.source_kind)}｜${emission.coverage.method}｜${emission.coverage.boundary}`
         : '未取得排放记录',
-      directory_scope: '全国碳市场重点排放单位名录（按名录年度展示）',
+      directory_scope: isDirectory
+        ? `CEA 纳管企业名录（名录 ${directoryYear ?? '年度未取得'} 年）；${directoryCoverageNote}`
+        : '全国碳市场重点排放单位名录（按名录年度展示）',
       directory_years: directory.years,
       directory_available: directory.available,
     },
-    source: isProject ? projectSource : emission.source,
-    directory_source: directory.source,
-    notes: buildNotes(f.metric, emission),
+    source: isProject ? projectSource : (isDirectory ? directorySourceSummary : emission.source),
+    directory_source: directorySourceSummary,
+    directory_summary: {
+      available: directory.available,
+      list_year: directoryYear,
+      list_year_options: directory.years || [],
+      total: directoryTotal,
+      covered_regions: directoryCovered,
+      as_of: directoryAsOf,
+      source_count: directory.sources?.length || 0,
+      coverage_note: directoryCoverageNote,
+    },
+    notes: buildNotes(f.metric, emission, directory, directoryCoverageNote),
     admin_alerts: emission?.warnings || [],
     data_quality: {
       province_conflicts: projects.province_conflicts,
@@ -1104,7 +1436,7 @@ export function buildRegionMap(query = {}) {
       registered_reduction_note:
         '登记减排量合计（tCO2e）未提供：现有批次字段不足以证明口径一致且无重复，不用业主预计量替代。',
       emissions_missing_policy: 'null；不补 0，不做演示热力',
-      directory_policy: '按名录年度、entity_key 去重；跨年不累加',
+      directory_policy: '按统一社会信用代码 + 名录年度去重；未收录为 null；跨年不累加',
     },
     generated_at: nowIso(),
   };
@@ -1123,7 +1455,7 @@ export const EXPORT_COLUMNS = [
   { key: 'value', label: '数值', align: 'right' },
   { key: 'unit', label: '单位' },
   { key: 'year', label: '年度', align: 'right' },
-  { key: 'scope', label: '范围', definition: 'ccer_project=公开项目；region_co2=区域 CO₂；national_ets=全国碳市场纳管排放' },
+  { key: 'scope', label: '范围', definition: 'ccer_project=公开项目；region_co2=区域 CO₂；national_ets=全国碳市场纳管排放；cea_entity=CEA 纳管企业名录' },
   { key: 'method', label: '核算方法' },
   { key: 'boundary', label: '核算边界' },
   { key: 'source_url', label: '来源链接' },
@@ -1140,6 +1472,12 @@ export const EXPORT_COLUMNS = [
   { key: 'ets_directory_year', label: '名录年度', align: 'right' },
   { key: 'ets_directory_count', label: '名录数量（本系统收录）', align: 'right' },
   { key: 'ets_directory_note', label: '名录覆盖说明' },
+  { key: 'ets_source_urls', label: '名录出处链接（全部）' },
+  { key: 'ets_source_codes', label: '名录出处代码（全部）' },
+  { key: 'ets_source_count', label: '名录出处份数', align: 'right' },
+  { key: 'ets_sectors', label: '已取得行业' },
+  { key: 'ets_missing_sectors', label: '尚未取得行业' },
+  { key: 'ets_coverage_note', label: '名录覆盖说明（详细）' },
   { key: 'project_count', label: '公开项目数', align: 'right' },
   { key: 'registered_count', label: '项目登记数', align: 'right' },
   { key: 'reduction_registered_count', label: '减排量登记项目数', align: 'right' },
@@ -1154,22 +1492,36 @@ export function buildRegionMapExport(query = {}) {
   const view = buildRegionMap(viewQuery);
   if (view.error) return view;
   const f = v.value;
+  const isDirectory = DIRECTORY_METRICS.includes(f.metric);
   const rows = [];
   const selectedRegions = f.region
     ? view.regions.filter((r) => r.group === f.region)
     : view.regions;
   for (const region of selectedRegions) {
     const e = region.emission;
-    const src = e?.source || (region.missing ? null : region.source) || null;
-    const dir = region.ets_directory || {};
-    const dirNote = dir.available
+    const dir = region.directory || region.ets_directory || {};
+    const dirSources = Array.isArray(dir.sources) ? dir.sources : [];
+    const dirUrls = dirSources.map((s) => s.source_url).filter(Boolean);
+    const dirCodes = dirSources.map((s) => s.source_code).filter(Boolean);
+    const src = isDirectory
+      ? region.source
+      : (e?.source || (region.missing ? null : region.source) || null);
+    const dirNote = dir.coverage_note || (dir.available
       ? (Number(dir.count) > 0
         ? '本系统已收录该省名录条数，不代表该省实际重点排放单位总数'
         : '本系统未收录该省名录，不代表真实没有重点排放单位')
-      : '本系统未取得该省名录';
-    const rowAsOf = PROJECT_METRICS.includes(f.metric)
-      ? (view.coverage.project_as_of || '')
-      : (e ? (dateOnly(e.collected_at) || '') : '');
+      : '本系统未取得该省名录');
+    const dirCountForExport = isDirectory
+      ? dir.count
+      : (region.ets_directory?.count ?? null);
+    const rowAsOf = isDirectory
+      ? (dir.as_of || view.coverage.directory_as_of || '')
+      : PROJECT_METRICS.includes(f.metric)
+        ? (view.coverage.project_as_of || '')
+        : (e ? (dateOnly(e.collected_at) || '') : '');
+    const missingReason = isDirectory
+      ? `本平台未收录该省 ${dir.year ?? ''} 年名录；不补 0`
+      : (view.metric === 'national_ets' ? '未取得该省纳管排放记录' : '未取得该省排放记录');
     rows.push({
       province: region.name,
       province_code: region.code,
@@ -1178,32 +1530,50 @@ export function buildRegionMapExport(query = {}) {
       metric_label: view.metric_label,
       value: region.value,
       unit: view.unit,
-      year: view.year,
+      year: isDirectory ? '' : view.year,
       scope: view.scope,
-      method: e?.methodology || src?.methodology || view.source?.methodology || '',
-      boundary: e?.boundary || src?.boundary || view.source?.boundary || '',
-      source_url: src?.source_url || '',
-      source_name: src?.source_name || '',
-      source_kind: src?.source_kind || '',
-      verification_status: src?.verification_status || '',
-      excerpt: src?.excerpt || '',
-      published_at: src?.published_at || '',
-      collected_at: src?.collected_at || '',
+      method: isDirectory
+        ? '按统一社会信用代码 + 名录年度去重'
+        : (e?.methodology || src?.methodology || view.source?.methodology || ''),
+      boundary: isDirectory
+        ? '本平台已收录，非全国/全省完整数量'
+        : (e?.boundary || src?.boundary || view.source?.boundary || ''),
+      source_url: isDirectory
+        ? (dirUrls[0] || '')
+        : (src?.source_url || ''),
+      source_name: isDirectory
+        ? (dirSources.length ? `省级生态环境主管部门公开名录（${dirSources.length} 份）` : '')
+        : (src?.source_name || ''),
+      source_kind: isDirectory ? (dirSources.length ? 'official' : '') : (src?.source_kind || ''),
+      verification_status: isDirectory
+        ? (dirSources.length ? 'source_recorded' : '')
+        : (src?.verification_status || ''),
+      excerpt: isDirectory ? dirNote : (src?.excerpt || ''),
+      published_at: isDirectory ? '' : (src?.published_at || ''),
+      collected_at: isDirectory ? (dir.as_of || '') : (src?.collected_at || ''),
       as_of: rowAsOf,
       missing: region.missing ? 1 : 0,
-      missing_reason: region.missing
-        ? (view.metric === 'national_ets' ? '未取得该省纳管排放记录' : '未取得该省排放记录')
-        : '',
-      dataset_key: view.dataset || '',
+      missing_reason: region.missing ? missingReason : '',
+      dataset_key: isDirectory ? '' : (view.dataset || ''),
       ets_directory_year: dir.year ?? '',
-      ets_directory_count: dir.count ?? '',
+      ets_directory_count: dirCountForExport ?? '',
       ets_directory_note: dirNote,
+      ets_source_urls: dirUrls.join(' | '),
+      ets_source_codes: dirCodes.join(' | '),
+      ets_source_count: dirSources.length,
+      ets_sectors: (dir.sectors || []).join('、'),
+      ets_missing_sectors: (dir.missing_sectors || []).join('、'),
+      ets_coverage_note: dir.coverage_note || '',
       project_count: region.project_count,
       registered_count: region.registered_count,
       reduction_registered_count: region.reduction_registered_count,
-      note: region.missing
-        ? '该省无排放记录；数据截至不借用名录日期；数据集级口径见 dataset_key'
-        : (region.value === 0 ? '真实 0，不是缺失' : ''),
+      note: isDirectory
+        ? (region.missing
+          ? `该省 ${dir.year ?? ''} 年名录未收录；0 不代表真实没有企业；名录采集截止日 ${dir.as_of || '未取得'}`
+          : `本平台已收录 ${dir.count} 家；${dir.coverage_note || ''}`)
+        : (region.missing
+          ? '该省无排放记录；数据截至不借用名录日期；数据集级口径见 dataset_key'
+          : (region.value === 0 ? '真实 0，不是缺失' : '')),
     });
   }
   // 未知省份项目单列，保留与 API 相同的口径；按区域筛选时不混入任何分组。
@@ -1239,6 +1609,12 @@ export function buildRegionMapExport(query = {}) {
         ets_directory_year: '',
         ets_directory_count: '',
         ets_directory_note: '',
+        ets_source_urls: '',
+        ets_source_codes: '',
+        ets_source_count: '',
+        ets_sectors: '',
+        ets_missing_sectors: '',
+        ets_coverage_note: '',
         project_count: item.project_count,
         registered_count: item.registered_count,
         reduction_registered_count: item.reduction_registered_count,
@@ -1248,23 +1624,35 @@ export function buildRegionMapExport(query = {}) {
   }
   const meta = {
     数据集: '省域地图',
-    数据截至: view.scope === 'ccer_project'
-      ? (view.coverage.project_as_of || '（见各行字段）')
-      : (view.coverage.emission_as_of || '排放未取得（不借用名录日期）'),
+    数据截至: isDirectory
+      ? (view.coverage.directory_as_of || '名录采集日期未取得')
+      : view.scope === 'ccer_project'
+        ? (view.coverage.project_as_of || '（见各行字段）')
+        : (view.coverage.emission_as_of || '排放未取得（不借用名录日期）'),
     项目快照截至: view.coverage.project_as_of || '未取得',
     名录采集日期: view.coverage.directory_as_of || '未取得',
     指标: view.metric_label,
-    年度: view.scope === 'ccer_project' ? '当前收录快照（项目指标）' : (view.year ?? '年度未取得'),
+    年度: isDirectory
+      ? (view.list_year ?? '名录年度未取得')
+      : view.scope === 'ccer_project'
+        ? '当前收录快照（项目指标）'
+        : (view.year ?? '年度未取得'),
     分组: f.region || '全国 34 地区',
-    统计口径: view.scope === 'ccer_project'
-      ? view.coverage.project_scope
-      : view.coverage.emission_scope,
-    来源: view.source?.source_name || '本平台公开项目库',
+    统计口径: isDirectory
+      ? view.coverage.directory_scope
+      : view.scope === 'ccer_project'
+        ? view.coverage.project_scope
+        : view.coverage.emission_scope,
+    来源: isDirectory
+      ? `省级生态环境主管部门公开名录（${view.directory_summary?.source_count ?? 0} 份）`
+      : (view.source?.source_name || '本平台公开项目库'),
     说明: [
       ...view.notes,
-      view.scope === 'ccer_project'
-        ? '公开项目为当前收录快照，不与历史排放年度混用；项目总数按登记号去重、阶段取并集。'
-        : '排放截至仅来自排放记录；名录采集日期单独列示。名录数量只表示本系统已收录，不代表该省实际重点排放单位总数。',
+      isDirectory
+        ? '名录按统一社会信用代码 + 名录年度去重；未收录为 null，不补 0；名录数量不是排放量，也不代表全国/全省完整数量。'
+        : view.scope === 'ccer_project'
+          ? '公开项目为当前收录快照，不与历史排放年度混用；项目总数按登记号去重、阶段取并集。'
+          : '排放截至仅来自排放记录；名录采集日期单独列示。名录数量只表示本系统已收录，不代表该省实际重点排放单位总数。',
     ].join('；'),
   };
   return {
@@ -1274,7 +1662,9 @@ export function buildRegionMapExport(query = {}) {
     rows,
     meta,
     dataset: '省域地图',
-    fileBase: `region_map_${view.metric}`,
+    fileBase: isDirectory
+      ? `region_map_${view.metric}_${view.list_year ?? 'unknown'}`
+      : `region_map_${view.metric}`,
   };
 }
 

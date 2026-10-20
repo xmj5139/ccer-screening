@@ -9,7 +9,7 @@ import {
   card, metricCard, comboChart, barChart, loading, emptyState, errorState, noteBlock,
   num, pct, esc, shortDate, chip, drawer, renderKvRows, toast,} from '../ui.js';
 import { sourceBlock, sourceLinkBlock, summaryBlock, summaryCoverageHint, rangeSummaryBar, chatPanel, bindChatPanel } from '../platform.js';
-import { mountRegionMap } from './region-map.js';
+import { mountRegionMap, mapQueryFromRoute } from './region-map.js';
 
 const RANGES = [
   { value: '30d', label: '近 30 天' },
@@ -26,12 +26,10 @@ export async function renderOverview(root) {
   let cea = null;
   let accounting = null;
   let regionMap = null;
+  let mapHandle = null;
   try {
     const qs = new URLSearchParams(Object.fromEntries(Object.entries(q).filter(([, v]) => v))).toString();
-    const mapQs = new URLSearchParams();
-    for (const key of ['domain', 'methodology_id', 'stage']) {
-      if (q[key]) mapQs.set(key, q[key]);
-    }
+    const mapQs = mapQueryFromRoute(q);
     [data, cea, regionMap] = await Promise.all([
       api(`/api/v2/overview${qs ? `?${qs}` : ''}`),
       // CEA 卡片失败不阻塞总览：如实显示空态与原因，不显示假数字
@@ -145,13 +143,16 @@ export async function renderOverview(root) {
   root.querySelectorAll('[data-f]').forEach((sel) => {
     sel.addEventListener('change', () => setQuery({ [sel.dataset.f]: sel.value }));
   });
-  root.querySelector('[data-reset]')?.addEventListener('click', () => setQuery({ range: null, domain: null, methodology_id: null, province: null, stage: null }));
+  root.querySelector('[data-reset]')?.addEventListener('click', () => setQuery({
+    range: null, domain: null, methodology_id: null, province: null, stage: null,
+    map: null, list_year: null,
+  }));
   // 省域地图：独立异步挂载，底图/接口失败不阻塞总览其他卡片。
   // 地图只接收阶段/领域/方法学筛选；总览省份筛选仅作为上下文高亮，避免其他省全部消失。
   const mapHost = root.querySelector('#region-map-slot');
   if (mapHost) {
     const stageLabel = (opts.stages || []).find((s) => s.key === q.stage)?.label || q.stage || null;
-    mountRegionMap({
+    mapHandle = mountRegionMap({
       root: mapHost,
       initialData: regionMap,
       filters: {
@@ -186,6 +187,10 @@ export async function renderOverview(root) {
       location.hash = drill.dataset.drill;
     }
   });
+  return () => {
+    mapHandle?.dispose?.();
+    mapHandle = null;
+  };
 }
 
 function exportUrlLink(path, format, query, label) {

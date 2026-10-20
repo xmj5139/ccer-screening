@@ -1166,9 +1166,40 @@ table.grid-sm tbody td { padding: 8px 10px; }
 
 .region-map-card .region-map-head { align-items: flex-start; }
 .region-map-head .card-actions { align-items: center; }
-.region-map-head [data-map-export][aria-disabled="true"] { opacity: .55; pointer-events: none; }
+.region-map-head [data-map-export][aria-disabled="true"],
+.region-map-head [data-map-refresh][aria-disabled="true"] { opacity: .55; pointer-events: none; }
 .region-map-head [data-map-updating][hidden] { display: none; }
+.region-map-refresh-meta {
+  color: var(--muted); font-size: 10.8px; line-height: 1.45; font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
 .region-map-body { padding: 0; }
+.region-directory-callout {
+  display: flex; align-items: center; justify-content: space-between; gap: 14px;
+  padding: 13px 20px; border-bottom: 1px solid var(--line-2); background: var(--lime-soft);
+}
+.region-directory-copy { min-width: 0; }
+.region-directory-line {
+  margin: 0; color: var(--ink); font-size: 14px; line-height: 1.5;
+}
+.region-directory-line b { font-weight: 650; }
+.region-directory-line strong {
+  margin-left: 4px; color: var(--brand-800); font-size: 25px; line-height: 1;
+  letter-spacing: -.02em; font-variant-numeric: tabular-nums;
+}
+.region-directory-sub {
+  margin: 3px 0 0; color: var(--ink-2); font-size: 11.2px; line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.region-map-refresh-error {
+  display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
+  margin: 10px 20px 0; padding: 10px 12px; border: 1px solid #e8d3a5; border-radius: 9px;
+  background: var(--warn-bg); color: var(--ink-2); font-size: 11.5px; line-height: 1.6;
+}
+.region-map-refresh-error[hidden] { display: none; }
+.region-map-refresh-error b { color: var(--warn); }
+.region-map-refresh-error p { margin: 2px 0 0; overflow-wrap: anywhere; }
+.region-map-refresh-error .btn { flex: none; }
 .region-map-toolbar {
   display: flex; align-items: center; justify-content: space-between; gap: 12px;
   padding: 13px 20px; border-bottom: 1px solid var(--line-2);
@@ -1224,7 +1255,7 @@ table.grid-sm tbody td { padding: 8px 10px; }
 .region-shape {
   stroke: #fffdf8; stroke-width: .9; stroke-linejoin: round; fill-rule: evenodd;
   vector-effect: non-scaling-stroke; cursor: pointer;
-  transition: fill .16s ease, stroke .16s ease, stroke-width .16s ease;
+  transition: fill .16s ease, stroke .16s ease;
 }
 .region-shape:hover { stroke: var(--brand-700); stroke-width: 1.9; }
 .region-shape:focus-visible {
@@ -1316,6 +1347,17 @@ table.grid-sm tbody td { padding: 8px 10px; }
 .region-evidence b { display: block; margin-bottom: 2px; color: var(--muted); font-size: 10.2px; font-weight: 600; }
 .region-evidence span { overflow-wrap: anywhere; }
 .region-detail-links { display: flex; flex-wrap: wrap; gap: 6px 12px; margin-top: 9px; font-size: 11.4px; }
+.region-directory-sources {
+  margin-top: 9px; padding-top: 8px; border-top: 1px dashed var(--line);
+  font-size: 10.8px; line-height: 1.55;
+}
+.region-directory-sources > b { display: block; color: var(--ink-2); font-size: 11px; font-weight: 600; }
+.region-directory-sources ul { list-style: none; margin: 4px 0 0; padding: 0; display: grid; gap: 4px; }
+.region-directory-sources li { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; min-width: 0; }
+.region-directory-sources li .link, .region-directory-sources li span {
+  min-width: 0; overflow-wrap: anywhere;
+}
+.region-directory-sources li .muted { flex: none; font-size: 9.8px; white-space: nowrap; }
 .region-samples { margin-top: 9px; padding-top: 8px; border-top: 1px dashed var(--line); font-size: 11px; }
 .region-samples > b { color: var(--ink-2); font-size: 11px; font-weight: 600; }
 .region-samples ul { list-style: none; margin: 4px 0 0; padding: 0; display: grid; gap: 3px; }
@@ -1420,7 +1462,14 @@ table.grid-sm tbody td { padding: 8px 10px; }
   .region-rank-list { max-height: 300px; }
   .region-map-notes { margin: 0 14px 14px; }
   .region-map-head { flex-direction: column; }
-  .region-map-head .card-actions { width: 100%; justify-content: flex-start; }
+  .region-map-head .card-actions { width: 100%; justify-content: flex-start; flex-wrap: wrap; }
+  .region-directory-callout { align-items: flex-start; flex-direction: column; gap: 9px; padding: 12px 14px; }
+  .region-map-refresh-error { margin: 10px 14px 0; }
+}
+@media (max-width: 560px) {
+  .region-map-refresh-meta { width: 100%; white-space: normal; }
+  .region-directory-line { font-size: 13px; }
+  .region-directory-line strong { font-size: 22px; }
 }
 @media (max-width: 560px) {
   .region-map-canvas { height: 330px; }

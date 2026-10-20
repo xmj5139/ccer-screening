@@ -34,6 +34,9 @@ export const state = {
   caliber: new Map(),
 };
 
+let activeCleanup = null;
+let renderSeq = 0;
+
 const MODULES = [
   { key: 'overview', label: '总览', icon: 'overview', render: renderOverview, desc: '最新政策、方法与项目分布、量价趋势、CEA 配额市场概况、最新研报与动态', summary: 'CCER 与 CEA 公开信息的综合视图，指标和图表跟随筛选。' },
   { key: 'policies', label: '政策和方法学', icon: 'policies', render: renderPolicies, desc: '全国 CCER 规则、配套技术文件与相关部委政策；CEA 配额政策入口、方法学原文与自动解读', summary: '官方政策原文、方法学文件与自动解读，按发布机关和状态归档。' },
@@ -358,6 +361,10 @@ function pageHeadHtml(mod) {
 }
 
 export async function render() {
+  const seq = ++renderSeq;
+  const cleanup = activeCleanup;
+  activeCleanup = null;
+  try { cleanup?.(); } catch { /* 清理失败不阻塞路由 */ }
   state.route = parseHash();
   if (!state.user) {
     document.title = `${authView === 'register' ? '注册' : '登录'} · 碳市场信息平台`;
@@ -392,12 +399,20 @@ export async function render() {
   bindSkipLink();
   const root = document.getElementById('module-root');
 
+  let cleanupNext = null;
   try {
-    await mod.render(root, state.route);
+    cleanupNext = await mod.render(root, state.route);
   } catch (e) {
     console.error(e);
     root.innerHTML = errorState(e);
   }
+  if (seq !== renderSeq) {
+    if (typeof cleanupNext === 'function') {
+      try { cleanupNext(); } catch { /* 过期渲染的清理失败不阻塞新路由 */ }
+    }
+    return;
+  }
+  activeCleanup = typeof cleanupNext === 'function' ? cleanupNext : null;
   window.scrollTo({ top: 0, behavior: prefersReducedMotion() ? 'auto' : 'smooth' });
 }
 
