@@ -46,7 +46,9 @@ export const BUILTIN_OFFICIAL_DOMAINS = [
   // 中国政府网：**只登记 www.gov.cn**（受控子域），不登记 gov.cn——
   // 否则 notmee.gov.cn 之类会被后缀匹配误判为官方（见 test/64 的伪装域名用例）。
   { domain: 'www.gov.cn', label: '中国政府网', kind: 'official', match_mode: 'subdomain' },
-  { domain: 'cets.org.cn', label: '全国温室气体自愿减排注册登记系统', kind: 'registry', match_mode: 'subdomain' },
+  { domain: 'cets.org.cn', label: '全国碳市场信息网', kind: 'official', match_mode: 'exact' },
+  { domain: 'www.cets.org.cn', label: '全国碳市场信息网', kind: 'official', match_mode: 'exact' },
+  { domain: 'ccer.cets.org.cn', label: '全国温室气体自愿减排注册登记系统', kind: 'registry', match_mode: 'subdomain' },
   { domain: 'ccer.com.cn', label: '全国温室气体自愿减排交易系统', kind: 'exchange', match_mode: 'subdomain' },
   { domain: 'cneeex.com', label: '上海环境能源交易所（全国碳市场）', kind: 'exchange', match_mode: 'subdomain' },
   { domain: 'shcneeex.com', label: '上海环境能源交易所（行情网关）', kind: 'exchange', match_mode: 'subdomain' },
@@ -117,7 +119,7 @@ export function hostMatchesDomain(host, domain, matchMode = 'subdomain') {
 
 /** 返回命中的官方域名登记（未命中返回 null）。 */
 export function matchOfficialDomain(host, domains = null) {
-  const list = domains || listOfficialDomains();
+  const list = [...(domains || listOfficialDomains())].sort((a, b) => String(b?.domain || '').length - String(a?.domain || '').length);
   for (const d of list) {
     if (!d || d.enabled === 0) continue;
     if (hostMatchesDomain(host, d.domain, d.match_mode || 'subdomain')) {

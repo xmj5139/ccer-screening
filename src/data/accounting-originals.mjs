@@ -201,16 +201,16 @@ export const ACCOUNTING_SOURCES = [...EXTRA_SOURCES,
   /* ---------------- 全国碳市场管理平台（CETS） ---------------- */
   {
     code: 'cets_portal',
-    name: '全国碳市场管理平台（CETS）',
+    name: '全国碳市场信息网（CETS）',
     url: 'https://www.cets.org.cn/',
-    authority: '全国碳排放权注册登记结算机构 / 生态环境部（以门户实际抬头为准）',
+    authority: '全国碳市场信息网（生态环境部应对气候变化司指导）',
     allowed_domains: CETS,
     source_type: 'portal',
     category: 'cets',
-    fetch_kind: 'direct_html',
+    fetch_kind: 'mcp_fetch',
     note:
-      '本机请求返回 HTTP 412 校验页（JS 挑战、<body> 为空）。生态环境部明确部分操作需登录管理平台账户，' +
-      '本库**不采集企业账户内数据**，也不假装取得登录后公告；只登记门户与公开可核实的入口。',
+      '公开首页及新闻已接入日更；政策、标准、问答按既有核算资料采集任务轮换更新。直连可能返回412，优先使用已配置抓取服务；' +
+      '企业账户内数据不采集，动态查询仅在取得有效行后计入。',
   },
 
   /* ---------------- 标准与技术规范（生态环境部正式发布原文） ---------------- */

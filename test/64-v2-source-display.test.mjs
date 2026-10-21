@@ -30,7 +30,7 @@ test('官方域名按精确 hostname 或受控子域命中', () => {
   const ok = [
     ['https://www.mee.gov.cn/xxgk/2026/x.html', 'mee.gov.cn'],
     ['https://mee.gov.cn/', 'mee.gov.cn'],
-    ['https://ccer.cets.org.cn/projectPublicity/projectPublicityList', 'cets.org.cn'],
+    ['https://ccer.cets.org.cn/projectPublicity/projectPublicityList', 'ccer.cets.org.cn'],
     ['https://overview.cneeex.com/c/2026-07-30/498086.shtml', 'cneeex.com'],
     ['http://www.ccer.com.cn/wcm/ccer/html/x.shtml', 'ccer.com.cn'],
   ];

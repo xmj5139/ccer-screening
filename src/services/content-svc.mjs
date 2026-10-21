@@ -21,6 +21,7 @@ import { canonicalizeUrl, pickSearchProvider } from './search-svc.mjs';
 import { pickFetchConnection } from './web-fetch-svc.mjs';
 import { runSearchWithFallback, fetchWithFallback } from './deepseek-fallback-svc.mjs';
 import { verifyContentItem, verifyConfig, ensureBuiltinRules } from './verification-svc.mjs';
+import { parseCetsArticlePage } from './accounting-parse.mjs';
 
 /* ==================================================================== */
 /*  一、来源与关键词种子（官网可用性逐一验证后再作为种子来源）             */
@@ -62,6 +63,27 @@ export const AUTHORITY_TIERS = {
  *   · 券商首页无法验证的一律停用，不用无效首页冒充来源。
  */
 export const SEED_SOURCES = [
+  {
+    id: 'src-cets-portal', name: '全国碳市场信息网',
+    url: 'https://www.cets.org.cn/', source_category: 'official',
+    kinds: ['industry_news'], enabled: 1, max_articles: 0,
+    note: '首页用于来源发现与归档；新闻、通知逐篇采集，不把门户首页作为新闻。',
+  },
+  {
+    id: 'src-cets-news', name: '全国碳市场信息网·新闻资讯',
+    url: 'https://www.cets.org.cn/xwzx/index.jhtml', source_category: 'official',
+    kinds: ['industry_news'], enabled: 1, is_index: true,
+    discovery_url: 'https://www.cets.org.cn/',
+    article_paths: ['/hjywt/', '/dfkx/', '/xyyw/', '/gjzx/', '/zjsj/'],
+    note: '主管信息门户的公开新闻栏目；逐篇保留原文、发布日期与来源。',
+  },
+  {
+    id: 'src-cets-notices', name: '全国碳市场信息网·通知公告',
+    url: 'https://www.cets.org.cn/tzgg/index.jhtml', source_category: 'official',
+    kinds: ['policy_notice'], enabled: 1, is_index: true,
+    discovery_url: 'https://www.cets.org.cn/', article_paths: ['/tzgg/'],
+    note: '正式通知与征求意见均按原文呈现；收录公告不自动改变政策及方法学状态。',
+  },
   // —— 交易机构 / 行业协会 ——
   {
     id: 'src-cets', name: '全国温室气体自愿减排注册登记系统（CCER 官方）',
@@ -719,13 +741,13 @@ export const MIN_ARTICLE_BODY_CHARS = 60;
 export function isSourceIndexUrl(raw) {
   try {
     const p = new URL(raw).pathname;
-    return /\/(?:index|default|main)(?:\d+)?\.(?:s?html?)$/i.test(p) ||
+    return /\/(?:index|default|main)(?:[_-]?\d+)?\.(?:s?html?|jhtml)$/i.test(p) ||
       /\/(?:app|download|downloads|about|contact)\/?$/i.test(p);
   } catch { return true; }
 }
 
 /** 从 HTML `<a>` 中发现候选正文链接（同域、非导航锚点、含主题关键词或完整日期） */
-export function discoverArticleLinks(html, baseUrl, { max = 8 } = {}) {
+export function discoverArticleLinks(html, baseUrl, { max = 8, pathPrefixes = null } = {}) {
   const src = String(html || '');
   const out = [];
   const seen = new Set();
@@ -736,9 +758,14 @@ export function discoverArticleLinks(html, baseUrl, { max = 8 } = {}) {
     return out;
   }
   const re = /<a\b[^>]*href\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
-  let m;
-  while ((m = re.exec(src))) {
-    const hrefRaw = m[1].trim();
+  const refs = [...src.matchAll(re)].map((m) => ({ href: m[1], text: m[2] }));
+  // MCP/Firecrawl commonly returns Markdown; preserve the same domain/navigation guards.
+  for (const m of src.matchAll(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+|\/[^\s)]+)\)/g)) {
+    if (m.index > 0 && src[m.index - 1] === '!') continue;
+    refs.push({ href: m[2], text: m[1] });
+  }
+  for (const ref of refs) {
+    const hrefRaw = ref.href.trim();
     if (!hrefRaw || /^(#|javascript:|mailto:|tel:)/i.test(hrefRaw)) continue;
     let u;
     try {
@@ -747,9 +774,10 @@ export function discoverArticleLinks(html, baseUrl, { max = 8 } = {}) {
       continue;
     }
     if (u.hostname !== base.hostname) continue;
+    if (Array.isArray(pathPrefixes) && pathPrefixes.length && !pathPrefixes.some((p) => u.pathname.startsWith(p))) continue;
     if (isSourceIndexUrl(u.toString())) continue;
     if (/\.(pdf|docx?|xlsx?|zip|rar|jpe?g|png|gif|mp4)$/i.test(u.pathname)) continue;
-    const text = String(m[2]).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+    const text = String(ref.text).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
     if (text.length < 6 || text.length > 120) continue;
     const path = u.pathname + u.search;
     if (/^\/(index|default|main)?\.?(s?html?)?$/i.test(u.pathname)) continue;
@@ -1223,10 +1251,15 @@ export async function collectFromSeedSources({
     return { ...tally, ok: false, reason: 'no_fetch_connection', message: '未配置网页抓取连接，无法读取种子来源页面。' };
   }
   const maxArticles = Math.max(0, Math.min(Number(maxArticlesPerSource) || 0, 10));
+  const fetchedPages = new Map();
+  const fetchPage = async (url) => {
+    if (!fetchedPages.has(url)) fetchedPages.set(url, await fetchWithFallback(url, { attempts: 2 }));
+    return fetchedPages.get(url);
+  };
 
   for (const s of seeds) {
     tally.attempted += 1;
-    const fr = await fetchWithFallback(s.url, { attempts: 2 });
+    const fr = await fetchPage(s.url);
     if (!fr.ok) {
       tally.failed += 1;
       tally.failures.push({ source: s.id, url: s.url, reason: fr.reason, message: fr.message });
@@ -1265,7 +1298,17 @@ export async function collectFromSeedSources({
     }
 
     /* ---- 2) 发现候选正文 URL（确定性规则） ---- */
-    const links = discoverArticleLinks(fr.raw_html || fr.html || '', s.url, { max: maxArticles });
+    const sourceMax = Number.isInteger(s.max_articles) ? Math.min(maxArticles, Math.max(0, s.max_articles)) : maxArticles;
+    let discoveredFrom = s.url;
+    let links = sourceMax ? discoverArticleLinks(fr.raw_html || fr.html || fr.content || '', s.url, { max: sourceMax, pathPrefixes: s.article_paths }) : [];
+    // Some CETS index pages remain client-side templates while its homepage exposes real article URLs.
+    if (!links.length && sourceMax && s.discovery_url) {
+      const fallback = await fetchPage(s.discovery_url);
+      if (fallback.ok) {
+        links = discoverArticleLinks(fallback.raw_html || fallback.html || fallback.content || '', s.discovery_url, { max: sourceMax, pathPrefixes: s.article_paths });
+        if (links.length) discoveredFrom = s.discovery_url;
+      }
+    }
     tally.articles_discovered += links.length;
     if (!links.length) {
       log(`  ${s.name}：首页未发现可用正文链接（不把首页当文章入库）`);
@@ -1280,41 +1323,45 @@ export async function collectFromSeedSources({
         log(`  正文抓取失败（${ar.reason}）：${link.url}`);
         continue;
       }
-      // 抓到的若是跳转/错误/占位页（正文过短），不算一次成功抓取，避免把导航页当文章
-      if (String(ar.content || '').trim().length < MIN_ARTICLE_BODY_CHARS) {
+      const isCets = new URL(link.url).hostname === 'www.cets.org.cn';
+      const cetsArticle = isCets ? parseCetsArticlePage(ar.raw_html || ar.html || ar.content || '', { baseUrl: link.url }) : null;
+      const articleBody = isCets ? cetsArticle?.body_text || '' : ar.content || '';
+      // CETS must have a recognizable article body, not a successful navigation-page fetch.
+      if ((isCets && !cetsArticle?.title) || String(articleBody).trim().length < MIN_ARTICLE_BODY_CHARS) {
         tally.articles_failed += 1;
         tally.failures.push({
           source: s.id, url: link.url, reason: 'body_too_short',
-          message: `正文仅 ${String(ar.content || '').trim().length} 字符（低于 ${MIN_ARTICLE_BODY_CHARS}），疑似跳转/错误页，未作为文章入库`,
+            message: `有效文章正文仅 ${String(articleBody).trim().length} 字符或缺少文章标题，疑似跳转/模板页，未作为文章入库`,
         });
         log(`  正文过短，跳过：${link.url}`);
         continue;
       }
       tally.articles_fetched += 1;
-      const date = extractPublishedDate(ar.raw_html || ar.html || '', { url: link.url, text: ar.content });
+      const date = extractPublishedDate(ar.raw_html || ar.html || '', { url: link.url, text: articleBody });
+      if (cetsArticle?.published_at) { date.published_at = cetsArticle.published_at; date.note = '发布日期取自全国碳市场信息网文章元数据。'; }
       if (date.published_at) tally.published_dated += 1; else tally.published_undated += 1;
       const sourceSummary = extractMetaDescription(ar.raw_html || ar.html || '');
-      const { key_points, claims } = extractClaimsAndPoints(ar.content || '');
+      const { key_points, claims } = extractClaimsAndPoints(articleBody);
       // 抽取式摘要与来源摘要分开：来源没有摘要时用抽取式，并标明 kind=extractive
-      const autoSummary = sourceSummary ? null : String(ar.content || '').replace(/\s+/g, ' ').slice(0, 300) || null;
+      const autoSummary = sourceSummary ? null : String(articleBody).replace(/\s+/g, ' ').slice(0, 300) || null;
       const up = upsertContent(
         {
           content_type: s.kinds[0],
           record_kind: 'article',
-          title: ar.title || link.text || '(无标题)',
+          title: cetsArticle?.title || ar.title || link.text || '(无标题)',
           publisher: s.name,
           published_at: date.published_at,
           source_url: link.url,
           source_category: s.source_category,
-          body_availability: availabilityFromFetch(ar, ar.content),
+          body_availability: availabilityFromFetch(ar, articleBody),
           summary: sourceSummary,
           auto_summary: autoSummary,
           auto_summary_kind: autoSummary ? 'extractive' : null,
           key_points,
           claims,
           topics: ['种子来源', s.name, ...(link.date_in_url ? ['URL 日期'] : [])],
-          body_snapshot: ar.content,
-          note: [date.note, `由「${s.name}」页面发现并抓取正文页；首页只作来源发现，不作为文章。`]
+          body_snapshot: articleBody,
+          note: [date.note, `由「${s.name}」发现并抓取正文页；发现页${discoveredFrom}；首页只作来源发现，不作为文章。`]
             .filter(Boolean).join('；'),
         },
         { actor, jobId }
