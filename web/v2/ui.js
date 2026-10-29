@@ -15,6 +15,8 @@
 
 /* ------------------------------ 格式化 ------------------------------ */
 
+import { datalistHtml, selectOptionsHtml } from './form-selects.js';
+
 export function num(v, digits = 0) {
   if (v === null || v === undefined || v === '' || Number.isNaN(Number(v))) return '—';
   return Number(v).toLocaleString('zh-CN', { minimumFractionDigits: digits, maximumFractionDigits: Math.max(digits, 2) });
@@ -518,12 +520,15 @@ export function filtersBar(fields, values = {}) {
   const html = fields.map((f) => {
     const v = values[f.key] ?? '';
     if (f.type === 'select') {
-      const opts = (f.options || []).map((o) => {
-        const val = typeof o === 'string' ? o : o.value;
-        const label = typeof o === 'string' ? o : o.label;
-        return `<option value="${esc(val)}" ${String(v) === String(val) ? 'selected' : ''}>${esc(label)}</option>`;
-      }).join('');
-      return `<label class="fld"><span>${esc(f.label)}</span><select data-filter="${esc(f.key)}"><option value="">全部</option>${opts}</select></label>`;
+      return `<label class="fld"><span>${esc(f.label)}</span><select data-filter="${esc(f.key)}">${selectOptionsHtml(
+        f.options || [], v, { allLabel: f.allLabel || '全部', allValue: '' },
+      )}</select></label>`;
+    }
+    if (f.type === 'datalist') {
+      const listId = `filter-${f.key}-options`;
+      return `<label class="fld"><span>${esc(f.label)}</span>
+        <input type="search" data-filter="${esc(f.key)}" value="${esc(v)}" placeholder="${esc(f.placeholder || '')}" list="${esc(listId)}">
+        ${datalistHtml(listId, f.options || [], v)}</label>`;
     }
     if (f.type === 'date') {
       return `<label class="fld"><span>${esc(f.label)}</span><input type="date" data-filter="${esc(f.key)}" value="${esc(v)}"></label>`;

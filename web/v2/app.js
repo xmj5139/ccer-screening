@@ -21,6 +21,7 @@ import { renderCea } from './modules/cea.js';
 import { renderMeasure } from './modules/measure.js';
 import { renderContent } from './modules/content.js';
 import { renderAdmin } from './modules/admin.js';
+import { renderSearch } from './modules/search.js';
 
 export const state = {
   user: null,
@@ -48,6 +49,9 @@ const MODULES = [
   { key: 'admin', label: '后台管理', icon: 'admin', render: renderAdmin, desc: '采集连接、CEA 配额市场配置与采集、搜索 API/MCP、模型配置、自动核验策略、每日任务与用户管理', summary: '采集连接、数据源、核验、任务与用户配置。' },
 ];
 
+/* 统一检索是顶栏入口 + 独立页，不增加一级导航（既有验收要求 8 个主模块）。 */
+const SEARCH_MODULE = {key:'search',label:'统一检索',icon:'search',summary:'跨政策、方法学、公开项目、研报动态、CEA 文件、排放因子与企业名录检索。'};
+
 /* 统一线性图标：24×24、1.7px 描边、圆角端点和连接点。 */
 const NAV_ICON_PATHS = {
   overview: '<rect x="3.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.5"/>',
@@ -58,6 +62,7 @@ const NAV_ICON_PATHS = {
   measure: '<rect x="4.5" y="3.5" width="15" height="17" rx="2.2"/><path d="M8 7.5h8M8 11.2h2.2M13.8 11.2H16M8 15h2.2M13.8 15H16M10.9 17.8h2.2"/>',
   content: '<path d="M4 5.5h12.5v13.8H6.4A2.4 2.4 0 0 1 4 16.9z"/><path d="M16.5 8H20v9.4a2 2 0 0 1-2 2h-8.5"/><path d="M7.5 9h5.5M7.5 12.2h5.5M7.5 15.4h3.2"/>',
   admin: '<path d="M4 7h9M17 7h3M4 12h3M11 12h9M4 17h9M17 17h3"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="15" cy="17" r="2"/>',
+  search: '<circle cx="10.8" cy="10.8" r="6.4"/><path d="m15.5 15.5 4.1 4.1"/>',
 };
 
 function navIcon(name) {
@@ -107,6 +112,7 @@ function parseHash() {
   const segs = pathPart.split('/').filter(Boolean);
   const query = Object.fromEntries(new URLSearchParams(queryPart || ''));
   const key = segs[0] || 'overview';
+  if (key === 'search') return { name: 'search', sub: segs[1] || null, query };
   const known = MODULES.some((m) => m.key === key) ? key : 'overview';
   return { name: known, sub: segs[1] || null, query };
 }
@@ -150,6 +156,15 @@ function headerHtml() {
         <p class="brand-sub">汇集 CCER 与 CEA 公开政策、项目、交易和研究资料</p>
       </div>
     </div>
+    <form class="topbar-search" id="topbar-search" role="search" aria-label="统一检索入口">
+      <label class="sr-only" for="topbar-search-input">检索公开资料</label>
+      <input id="topbar-search-input" name="q" type="search" maxlength="100"
+        value="${esc(state.route.name === 'search' ? state.route.query.q || '' : '')}"
+        placeholder="检索政策、方法学、项目、研报…" autocomplete="off">
+      <button type="submit" aria-label="开始检索" title="统一检索">
+        <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="10.8" cy="10.8" r="6.4"/><path d="m15.5 15.5 4.1 4.1"/></svg>
+      </button>
+    </form>
     <div class="topbar-right">
       <div class="sync-badges" aria-label="数据状态">
         <span class="badge badge-asof">数据截至 <b>${esc(sync.data_as_of || '—')}</b></span>
@@ -355,9 +370,19 @@ function pageHeadHtml(mod) {
       </div>
       <div class="page-meta" aria-label="页面数据状态">
         <div class="page-meta-item"><span>数据截至</span><b>${esc(asOf)}</b></div>
-        <div class="page-meta-item"><span>当前视图</span><b>${isAdminView ? '管理员' : '公开信息'}</b></div>
+        <div class="page-meta-item"><span>当前视图</span><b>${isAdminView ? '管理员' : state.route.name === 'search' ? '公开检索' : '公开信息'}</b></div>
       </div>
     </header>`;
+}
+
+function bindTopbarSearch() {
+  const form = document.getElementById('topbar-search');
+  if (!form) return;
+  form.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const q = document.getElementById('topbar-search-input')?.value.trim() || '';
+    goto('search', q ? { q } : {});
+  });
 }
 
 export async function render() {
@@ -376,7 +401,9 @@ export async function render() {
     goto('overview');
     return;
   }
-  const mod = MODULES.find((m) => m.key === state.route.name) || MODULES[0];
+  const mod = state.route.name === 'search'
+    ? SEARCH_MODULE
+    : (MODULES.find((m) => m.key === state.route.name) || MODULES[0]);
   const banners = bannersHtml();
   document.title = `${mod.label} · 碳市场信息平台`;
   app().innerHTML = `
@@ -397,11 +424,14 @@ export async function render() {
 
   document.getElementById('btn-logout')?.addEventListener('click', logout);
   bindSkipLink();
+  bindTopbarSearch();
   const root = document.getElementById('module-root');
 
   let cleanupNext = null;
   try {
-    cleanupNext = await mod.render(root, state.route);
+    cleanupNext = state.route.name === 'search'
+      ? await renderSearch(root, state.route)
+      : await mod.render(root, state.route);
   } catch (e) {
     console.error(e);
     root.innerHTML = errorState(e);

@@ -45,6 +45,7 @@ import { syncStatus } from './services/collect-svc.mjs';
 import { get as dbGet } from './core/db.mjs';
 import * as registry from './services/registry-svc.mjs';
 import { quickGasEstimate, quickGasMeta } from './services/quick-estimate-svc.mjs';
+import * as formOptions from './services/form-options-svc.mjs';
 // CEA（全国碳排放配额）专题路由：独立文件，装配到同一张表（共用守卫与信封规约）
 import { CEA_RAW_ROUTES } from './routes-cea.mjs';
 // PDF 解析 / OCR 后台路由（docs/36）：同样装配到同一张表，共用后台角色守卫
@@ -53,6 +54,10 @@ import { OCR_RAW_ROUTES } from './routes-ocr.mjs';
 import { ACCOUNTING_RAW_ROUTES } from './routes-accounting.mjs';
 // 碳市场信息平台路由（docs/44）：统一摘要 / 行情区间口径 / 平台问答 / 后台运行与内容维护
 import { PLATFORM_RAW_ROUTES } from './routes-platform.mjs';
+// 信息治理 / 历史补采 / 方法学版本 / 统一检索（docs/74）
+import { GOVERNANCE_RAW_ROUTES } from './routes-governance.mjs';
+// 公开信息智能化第一阶段：正文清洗/实质变化/字段证据/RSS（docs/86）
+import { INTELLIGENCE_RAW_ROUTES } from './routes-intelligence.mjs';
 // 统一摘要与来源展示口径（docs/44 第 2、3 条）：列表与详情统一挂载，读路径只读缓存
 import * as summary from './services/summary-svc.mjs';
 import { sourceDisplay } from './services/source-display-svc.mjs';
@@ -273,6 +278,13 @@ const RAW_ROUTES = [
     states: Object.values(verify.VERIFY_RESULTS),
     note: '四个状态互斥；「自动核验通过」只表示证据一致性，不表示独立审计或主管部门确认。',
   })],
+
+  /* 表单有限选项（省份/方法学/CEA 行业与年度/来源建议）；只读公开字段，不改变筛选语义。 */
+  ['GET', '/api/v2/meta/form-options', async () => {
+    const g = readGuard();
+    if (g) return { status: g.status, body: g };
+    return formOptions.formOptions();
+  }],
 
   /* ================= 总览 ================= */
   ['GET', '/api/v2/overview', async (ctx) => {
@@ -1311,7 +1323,7 @@ const RAW_ROUTES = [
  * （普通用户 403）；已停用路由保持「对任何角色都 410」，不参与角色判定。
  * CEA 路由（src/routes-cea.mjs）在同一张表内装配，共用同一套守卫与信封规约。
  */
-export const V2_ROUTES = [...RAW_ROUTES, ...CEA_RAW_ROUTES, ...OCR_RAW_ROUTES, ...ACCOUNTING_RAW_ROUTES, ...PLATFORM_RAW_ROUTES].map(([method, pattern, handler]) =>
+export const V2_ROUTES = [...RAW_ROUTES, ...CEA_RAW_ROUTES, ...OCR_RAW_ROUTES, ...ACCOUNTING_RAW_ROUTES, ...PLATFORM_RAW_ROUTES, ...GOVERNANCE_RAW_ROUTES, ...INTELLIGENCE_RAW_ROUTES].map(([method, pattern, handler]) =>
   (pattern.startsWith('/api/v2/admin/') || pattern.startsWith('/api/v2/accounting/admin/')) && handler !== retiredHandler
     ? [method, pattern, withAdminAreaGuard(handler)]
     : [method, pattern, handler]

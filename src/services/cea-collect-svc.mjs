@@ -34,6 +34,7 @@ import { verifyConfig, pickVerifyProvider, verifyObject } from './verification-s
 import { parsePdfDocument } from './pdf-parse-svc.mjs';
 import {
   htmlToText, parseCeaDailyReport, parseEntityRows, parseIntentionRows, parseAnnualClosureNotice,
+  detectCeaNonTargetPage,
 } from './cea-parse.mjs';
 import {
   parseDailyOverview, parseMarketByDate, parseSubStat, parseTradeIntents, parseHolidays, parseHisKline,
@@ -43,6 +44,7 @@ import {
   upsertCeaEntity, upsertCeaIntention, upsertCeaOverview, upsertCeaCalendarDates, recordQuoteSource,
   recordCeaGap, closeCeaGapsByPrefixes, saveCeaChecks, CEA_GAP_DATASETS,
   seedCeaBaseData, CEA_PRICE_REGIME_2026, applyCeaAnnualClosureNotice, upsertCeaPriceHistory, reconcileCeaCalendar,
+  recordCeaPageExclusion,
 } from './cea-svc.mjs';
 
 /* ==================================================================== */
@@ -314,6 +316,36 @@ export async function collectOneCeaDaily(item, { actor = 'system:cea-collect', j
   if (deadlineAt && deadlineAt - Date.now() <= 500) {
     return { ok: false, stage: 'fetch', reason: 'batch_budget_exceeded', message: '批次总时间上限已到：该日报未发出请求（留待下一批）', url: item.url, deadline_exceeded: true };
   }
+  // 已按标题/主内容确定性规则排除的非目标页：不重复抓取/解析，也不新建行情行。
+  const knownExclusion = get('SELECT * FROM cea_page_exclusion WHERE url=?', [item.url]);
+  if (knownExclusion) {
+    const exclusion = recordCeaPageExclusion({
+      url: item.url,
+      sourceCode: item.sourceCode || knownExclusion.source_code || null,
+      snapshotId: knownExclusion.snapshot_id,
+      contentHash: knownExclusion.content_hash,
+      title: knownExclusion.title,
+      rule: knownExclusion.rule,
+      evidence: knownExclusion.evidence,
+      snapshotExcerpt: knownExclusion.snapshot_excerpt,
+      actor,
+    });
+    if (jobId) {
+      addCeaStep(jobId, {
+        stage: 'parse', target: item.url, status: 'skipped', items: 0,
+        message: `已登记非目标页（${knownExclusion.rule}）：不重复抓取/解析，不建行情行`,
+        snapshotId: knownExclusion.snapshot_id,
+        detail: { exclusion_id: knownExclusion.id, cached: true },
+      });
+    }
+    return {
+      ok: false, stage: 'non_target', reason: 'non_target_page_cached', excluded: true,
+      message: `该 URL 已登记为非目标页（规则 ${knownExclusion.rule}）；按记录停止重复抓取/解析。`,
+      url: item.url, snapshotId: knownExclusion.snapshot_id,
+      exclusion_id: knownExclusion.id, exclusion_rule: knownExclusion.rule,
+      gaps_mitigated: exclusion.gap_updated || 0,
+    };
+  }
   const fetched = await fetchAndSnapshot(item.url, {
     allowedDomains: allowed, sourceId: source?.id || null, sourceCode: item.sourceCode || null,
     timeoutMs: cfg.request_timeout_ms, actor, deadlineAt,
@@ -339,9 +371,41 @@ export async function collectOneCeaDaily(item, { actor = 'system:cea-collect', j
     return { ok: false, stage: 'fetch', reason: fetched.reason, message: fetched.message, url: item.url, snapshotId: fetched.snapshotId };
   }
 
+  // 解析行情前先做确定性的页面归属判定：企业基本信息、招聘、导航等明确非目标页
+  // 不进入行情解析、不写任何行情行；同 URL 历史 parse gap 留痕后停止重复重试。
+  // 未知/空/访问失败不在此判定，仍按原流程保留真实缺口。
+  const pageKind = detectCeaNonTargetPage(fetched.body, { url: item.url });
+  if (pageKind.non_target) {
+    const exclusion = recordCeaPageExclusion({
+      url: item.url,
+      sourceCode: item.sourceCode || null,
+      snapshotId: fetched.snapshotId,
+      contentHash: fetched.hash,
+      title: pageKind.title,
+      rule: pageKind.rule,
+      evidence: pageKind.evidence,
+      snapshotExcerpt: pageKind.main_excerpt,
+      actor,
+    });
+    if (jobId) {
+      addCeaStep(jobId, {
+        stage: 'parse', target: item.url, status: 'skipped', items: 0,
+        message: `非目标页排除（${pageKind.rule}）：${pageKind.reason}；未建行情行，不反复重试`,
+        snapshotId: fetched.snapshotId,
+        detail: { exclusion_id: exclusion.id || null, rule: pageKind.rule, title: pageKind.title },
+      });
+    }
+    return {
+      ok: false, stage: 'non_target', reason: 'non_target_page', excluded: true,
+      message: `${pageKind.reason}（规则 ${pageKind.rule}）；未写入行情行。`,
+      url: item.url, snapshotId: fetched.snapshotId,
+      exclusion_id: exclusion.id || null, exclusion_rule: pageKind.rule,
+      gaps_mitigated: exclusion.gap_updated || 0,
+    };
+  }
+
   const parsed = parseCeaDailyReport(fetched.body, { url: item.url, tradeDateHint: item.dateHint || null });
-  if (jobId) {
-    addCeaStep(jobId, {
+  if (jobId) {    addCeaStep(jobId, {
       stage: 'parse', target: item.url, status: parsed.ok ? 'ok' : 'failed',
       message: `parse_status=${parsed.parse_status}；${parsed.parse_note}`.slice(0, 900),
       snapshotId: fetched.snapshotId,

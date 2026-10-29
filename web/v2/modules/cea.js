@@ -25,6 +25,9 @@ import {
   num, pct, delta, esc, truncate, shortDate, dateTime, renderKvRows, filtersBar, exportButtons,
 } from '../ui.js';
 import { summaryBlock, summaryCoverageHint, sourceBlock, sourceLinkBlock } from '../platform.js';
+import {
+  datalistHtml, fallbackFormOptions, loadFormOptions, selectOptionsHtml,
+} from '../form-selects.js';
 
 /* ------------------------------ 标签字典 ------------------------------ */
 
@@ -224,7 +227,8 @@ export async function renderCea(root, route) {
     <div id="cea-body">${loading()}</div>`;
   const body = document.getElementById('cea-body');
   try {
-    if (tab === 'quote') await renderQuote(body, q);
+    if (q.entity) await renderEntityProfile(body, q);
+    else if (tab === 'quote') await renderQuote(body, q);
     else if (tab === 'policy') await renderPolicy(body, q);
     else if (tab === 'calendar') await renderCalendar(body, q);
     else if (tab === 'entities') await renderEntities(body, q);
@@ -666,12 +670,16 @@ async function renderPolicy(body, q) {
   const docStatus = q.doc_status || '';
   const keyword = q.q || '';
   const withAttachments = q.include_attachments === 'true';
-  const data = await api(`/api/v2/cea/documents?${qs({
-    doc_type: docType, doc_status: docStatus, sector, year, q: keyword,
-    include_attachments: withAttachments ? 'true' : '', limit: 200,
-  })}`);
+  const [data, options] = await Promise.all([
+    api(`/api/v2/cea/documents?${qs({
+      doc_type: docType, doc_status: docStatus, sector, year, q: keyword,
+      include_attachments: withAttachments ? 'true' : '', limit: 200,
+    })}`),
+    loadFormOptions(api).catch(() => fallbackFormOptions()),
+  ]);
   const rows = data.rows || [];
   const paired = Boolean(sector || year);
+  const documentYears = options.cea.years.documents;
 
   body.innerHTML = `
   <div class="filters">
@@ -680,8 +688,8 @@ async function renderPolicy(body, q) {
       ${Object.entries(DOC_TYPE_LABEL).map(([k, l]) => `<option value="${k}" ${docType === k ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select></label>
     <label class="fld"><span>效力状态</span><select data-f="doc_status"><option value="">全部</option>
       ${Object.entries(DOC_STATUS_LABEL).map(([k, l]) => `<option value="${k}" ${docStatus === k ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select></label>
-    <label class="fld"><span>行业</span><input type="search" data-f="sector" value="${esc(sector)}" placeholder="如 发电 / 钢铁"></label>
-    <label class="fld"><span>适用年度</span><input type="number" data-f="year" value="${esc(year)}" min="2000" max="2100" placeholder="如 2026"></label>
+    <label class="fld"><span>行业</span><select data-f="sector">${selectOptionsHtml(options.cea.sectors, sector, { allLabel: '全部行业' })}</select></label>
+    <label class="fld"><span>适用年度</span><select data-f="year">${selectOptionsHtml(documentYears, year, { allLabel: '全部年度' })}</select></label>
     <label class="fld"><span>附件行</span><select data-f="include_attachments">
       <option value="" ${!withAttachments ? 'selected' : ''}>默认隐藏（不重复计数）</option>
       <option value="true" ${withAttachments ? 'selected' : ''}>显示官方 PDF 附件行</option></select></label>
@@ -975,6 +983,157 @@ function entitySourceCell(r) {
     `<div class="tech-details-body">${entries.map((e) => `<a class="link" href="${e.href}" target="_blank" rel="noreferrer noopener">${esc(e.label)}</a>`).join('<br>')}</div></details>`;
 }
 
+async function renderEntityProfile(body, q) {
+  const d = await api(`/api/v2/cea/entities/${encodeURIComponent(q.entity)}`);
+  const e = d.entity || {};
+  const yearRows = d.years || [];
+  const aliases = d.aliases || [];
+  const relations = d.industry_relations || [];
+  const sources = d.sources || [];
+  const revisions = d.revisions || [];
+  const mentions = d.mentions || [];
+  const back = '#/cea?tab=entities';
+  body.innerHTML = `
+  <div class="callout">
+    <b>企业档案（来源明确的公开名录与修订记录）</b>
+    <p>规范标识：<code>${esc(d.profile_id || '—')}</code>｜识别依据：${esc(d.identity_basis || '—')}</p>
+    <p class="hint">${esc(d.note || '')}</p>
+    <p><a class="link" href="${back}">← 返回企业名录</a></p>
+  </div>
+  <div class="metrics metrics-sm">
+    ${metric({ label: '企业名称', value: e.name || '—', unit: '', sub: e.credit_code ? `统一社会信用代码 ${e.credit_code}` : (e.raw_credit_code ? `标准代码留空｜原文 ${e.raw_credit_code}` : '信用代码未披露'), asOf: e.data_as_of || '', source: e.source_url ? '公开名录' : '名录记录' })}
+    ${metric({ label: '地区', value: [e.province, e.city].filter(Boolean).join(' / ') || '—', unit: '', sub: '跨年度保留原值，不跨地区强合并' })}
+    ${metric({ label: '名录年度', value: String(yearRows[0]?.list_year ?? e.list_year ?? '—'), unit: '', sub: `共 ${yearRows.length} 个年度记录` })}
+    ${metric({ label: '企业实际排放量', value: '不提供', unit: '', sub: '名录数量不等于排放量；不用国际估算填补', warn: true })}
+  </div>
+  ${card({
+    title: '名称与别名',
+    subtitle: '仅展示历年名录名称、管理员补充且带来源的别名；不按名称相似度自动合并',
+    body: aliases.length ? table({
+      rows: aliases,
+      pageSize: 12,
+      columns: [
+        { key: 'alias', label: '名称/别名' },
+        { key: 'kind', label: '类型', render: (r) => esc(r.kind === 'historical_name' ? '历年名称' : '来源别名') },
+        { key: 'source_code', label: '来源代码', render: (r) => esc(r.source_code || '—') },
+        { key: 'source_url', label: '来源', render: (r) => (safeHttpHref(r.source_url) ? `<a class="link" href="${esc(safeHttpHref(r.source_url))}" target="_blank" rel="noreferrer noopener">公开来源</a>` : '—') },
+        { key: 'evidence_note', label: '依据', render: (r) => esc(truncate(r.evidence_note || '—', 60)) },
+      ],
+    }) : '<p class="muted">暂无可核对的别名；原始名称即当前名称。</p>',
+    note: d.alias_evidence_note || '',
+  })}
+  ${card({
+    title: '年度、行业与地区关系',
+    subtitle: '同一主体跨年度保留；多行业、多来源逐条保留，不用后一年覆盖前一年',
+    body: table({
+      rows: yearRows,
+      pageSize: 12,
+      columns: [
+        { key: 'list_year', label: '年度', align: 'right' },
+        { key: 'name', label: '名录名称', render: (r) => esc(truncate(r.name, 36)) },
+        { key: 'province', label: '省份' },
+        { key: 'city', label: '城市' },
+        { key: 'sector', label: '行业（聚合）', render: (r) => esc(r.sector || '—') },
+        { key: 'status', label: '状态', render: (r) => esc(ENTITY_STATUS_LABEL[r.status] || r.status || '—') },
+        { key: 'source_url', label: '来源', render: (r) => (safeHttpHref(r.source_url) ? `<a class="link" href="${esc(safeHttpHref(r.source_url))}" target="_blank" rel="noreferrer noopener">公开名录</a>` : '—') },
+      ],
+      emptyText: '暂无年度记录',
+    }),
+  })}
+  ${card({
+    title: '行业成员关系（按年度/来源）',
+    subtitle: '同一年度可属于多个行业名单；每条保留来源，不做单一行业覆盖',
+    body: relations.length ? table({
+      rows: relations.map((r) => ({
+        ...r,
+        sectors_text: (r.sectors || []).join('、') || '行业未标注',
+        sources_text: (r.sources || []).map((s) => s.source_code || s.source_url).filter(Boolean).join('；') || '来源未标注',
+      })),
+      pageSize: 10,
+      columns: [
+        { key: 'list_year', label: '年度', align: 'right' },
+        { key: 'sectors_text', label: '行业（可多个）' },
+        { key: 'sources_text', label: '来源' },
+      ],
+      emptyText: '暂无行业成员关系',
+    }) : '<p class="muted">暂无成员关系；主体行业字段仅作聚合展示。</p>',
+  })}
+  ${card({
+    title: '公开来源',
+    subtitle: `${sources.length} 个已记录来源；来源明确才保留，不猜测补齐`,
+    body: sources.length ? table({
+      rows: sources,
+      pageSize: 12,
+      columns: [
+        { key: 'source_code', label: '来源代码', render: (r) => esc(r.source_code || '—') },
+        { key: 'list_year', label: '年度', align: 'right', render: (r) => esc(String(r.list_year ?? '—')) },
+        { key: 'sector', label: '行业', render: (r) => esc(r.sector || '—') },
+        { key: 'source_url', label: '链接', render: (r) => (safeHttpHref(r.source_url) ? `<a class="link" href="${esc(safeHttpHref(r.source_url))}" target="_blank" rel="noreferrer noopener">打开来源</a>` : '—') },
+        { key: 'as_of', label: '采集/截至', render: (r) => esc(r.as_of || '—') },
+      ],
+    }) : '<p class="muted">暂无来源链接。</p>',
+  })}
+  ${card({
+    title: '历史变化',
+    subtitle: '名称/地区/行业/状态变化逐条留痕；没变化的年度不伪造修订',
+    body: revisions.length ? table({
+      rows: revisions,
+      pageSize: 10,
+      columns: [
+        { key: 'revised_at', label: '时间', render: (r) => esc(dateTime(r.revised_at)) },
+        { key: 'field', label: '字段' },
+        { key: 'old_value', label: '旧值', render: (r) => esc(r.old_value || '—') },
+        { key: 'new_value', label: '新值', render: (r) => esc(r.new_value || '—') },
+        { key: 'reason', label: '原因', render: (r) => esc(truncate(r.reason || '—', 50)) },
+      ],
+    }) : '<p class="muted">暂无字段级修订记录。</p>',
+  })}
+  ${card({
+    title: '正文提及的相关公开资料',
+    subtitle: '只表示标题/正文提及，不宣称官方隶属或政策关系',
+    body: mentions.length ? `<ul class="bullets">${mentions.map((m) => `<li><a class="link" href="#/content?q=${encodeURIComponent(m.title || '')}" data-entity-mention="${esc(m.id)}">${esc(m.title)}</a>
+      <span class="muted">${esc(m.publisher || '')}${m.published_at ? `｜${esc(shortDate(m.published_at))}` : ''}｜${esc(m.relation)}</span></li>`).join('')}</ul>`
+      : '<p class="muted">暂无正文提及记录；不据此推断企业关系。</p>',
+  })}
+  ${state.user?.role === 'admin' ? card({
+    title: '管理员补充别名（有来源才可审计）',
+    subtitle: '只追加来源明确的别名；不会合并其他企业，也不会改写原始名录',
+    body: `<form id="entity-alias-form" class="form-grid">
+      <label class="fld"><span>别名/曾用名</span><input name="alias" maxlength="200" required></label>
+      <label class="fld"><span>来源代码（可选）</span><input name="source_code" maxlength="80"></label>
+      <label class="fld fld-wide"><span>来源链接（http/https）</span><input name="source_url" maxlength="500" placeholder="https://..."></label>
+      <label class="fld fld-wide"><span>证据说明</span><input name="evidence_note" maxlength="500" placeholder="来源在何处写出该别名"></label>
+      <div class="quick-actions"><button class="btn btn-sm" type="submit">保存别名</button></div>
+      <div id="entity-alias-msg"></div>
+    </form>`,
+    note: '新增别名写入 cea_entity_alias 并记录审计；没有来源的别名不应当作为合并依据。',
+  }) : ''}
+  <div class="callout callout-warn"><b>不推造排放</b><p>${esc(d.emission_note || '')}</p></div>`;
+
+  body.querySelector('#entity-alias-form')?.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    const form = ev.currentTarget;
+    const msg = body.querySelector('#entity-alias-msg');
+    const f = new FormData(form);
+    try {
+      const out = await api(`/api/v2/admin/cea/entities/${encodeURIComponent(d.entity.id)}/aliases`, {
+        method: 'POST',
+        body: {
+          alias: f.get('alias') || '',
+          source_code: f.get('source_code') || null,
+          source_url: f.get('source_url') || null,
+          evidence_note: f.get('evidence_note') || null,
+        },
+      });
+      msg.innerHTML = `<div class="callout callout-ok"><b>别名已保存</b><p>${esc(out.alias || '')}</p></div>`;
+      toast('别名已保存并写入审计', 'ok');
+    } catch (err) {
+      msg.innerHTML = errorState(err);
+      toast(err.body?.error || err.message, 'danger');
+    }
+  });
+}
+
 async function renderEntities(body, q) {
   const province = q.province || '';
   const sector = q.sector || '';
@@ -983,19 +1142,29 @@ async function renderEntities(body, q) {
   const keyword = q.q || '';
   const limit = 200;
   const offset = Math.max(0, Number(q.offset) || 0);
-  const data = await api(`/api/v2/cea/entities?${qs({
-    province, sector, list_year: listYear, status, q: keyword, limit, offset,
-  })}`);
+  const [data, options] = await Promise.all([
+    api(`/api/v2/cea/entities?${qs({
+      province, sector, list_year: listYear, status, q: keyword, limit, offset,
+    })}`),
+    loadFormOptions(api).catch(() => fallbackFormOptions()),
+  ]);
   const rows = data.rows || [];
   const coverage = data.coverage || {};
   const filtered = Boolean(province || sector || listYear || status || keyword);
+  const entityYears = options.cea.years.entities;
 
   const entityTable = table({
     rows,
     pageSize: 25,
     columns: [
-      { key: 'name', label: '企业名称', render: (r) => esc(truncate(r.name, 40)) },
-      { key: 'credit_code', label: '统一社会信用代码', render: (r) => (r.credit_code ? `<code>${esc(r.credit_code)}</code>` : '<span class="muted">未披露</span>') },
+      { key: 'name', label: '企业名称', render: (r) => `<a class="link" href="#/cea?tab=entities&entity=${encodeURIComponent(r.id)}" title="进入企业档案">${esc(truncate(r.name, 40))}</a>` },
+      { key: 'credit_code', label: '统一社会信用代码', render: (r) => {
+        if (r.credit_code) return `<code>${esc(r.credit_code)}</code>`;
+        if (r.raw_credit_code) {
+          return `<span class="muted">标准代码留空</span><br><span class="hint">原文：${esc(truncate(r.raw_credit_code, 24))}（校验位异常，非阻塞）</span>`;
+        }
+        return '<span class="muted">未披露</span>';
+      } },
       { key: 'province', label: '省份', render: (r) => esc(r.province || '—') },
       { key: 'city', label: '城市', render: (r) => esc(r.city || '—') },
       { key: 'sector', label: '行业', render: (r) => esc(r.sector || '—') },
@@ -1025,11 +1194,12 @@ async function renderEntities(body, q) {
   </div>
 
   <div class="filters">
-    <label class="fld"><span>省份</span><input type="search" data-f="province" value="${esc(province)}" placeholder="如 福建省"></label>
-    <label class="fld"><span>行业</span><input type="search" data-f="sector" value="${esc(sector)}" placeholder="如 发电"></label>
-    <label class="fld"><span>名录年度</span><input type="number" data-f="list_year" value="${esc(listYear)}" min="2000" max="2100" placeholder="如 2026"></label>
-    <label class="fld"><span>名录状态</span><select data-f="status"><option value="">全部</option>
-      ${Object.entries(ENTITY_STATUS_LABEL).map(([k, l]) => `<option value="${k}" ${status === k ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select></label>
+    <label class="fld"><span>省份</span><select data-f="province">${selectOptionsHtml(options.cea.provinces, province, { allLabel: '全部省份' })}</select></label>
+    <label class="fld"><span>行业</span><select data-f="sector">${selectOptionsHtml(options.cea.sectors, sector, { allLabel: '全部行业' })}</select></label>
+    <label class="fld"><span>名录年度</span><select data-f="list_year">${selectOptionsHtml(entityYears, listYear, { allLabel: '全部年度' })}</select></label>
+    <label class="fld"><span>名录状态</span><select data-f="status">${selectOptionsHtml(
+      Object.entries(ENTITY_STATUS_LABEL).map(([value, label]) => ({ value, label })), status, { allLabel: '全部状态' },
+    )}</select></label>
     <label class="fld"><span>关键词（企业名称/信用代码）</span><input type="search" data-f="q" value="${esc(keyword)}"></label>
     <span class="fld-actions">${exportLinks('entities', { province, sector, list_year: listYear, status })}<button class="btn btn-sm" data-reset>重置</button></span>
   </div>
@@ -1038,6 +1208,7 @@ async function renderEntities(body, q) {
     ${metric({ label: '名录条目（筛选后）', value: num(data.total), unit: '条', sub: `本页 ${rows.length} 条｜全库覆盖省份 ${num(coverage.provinces)} 个`, asOf: coverage.as_of || '', source: '官方公开名录' })}
     ${metric({ label: '名录年度', value: (coverage.list_years || []).join('、') || '—', unit: '', sub: '以统一社会信用代码 + 名录年度为标识', asOf: coverage.as_of || '', source: '官方公开名录' })}
     ${metric({ label: '全库未披露信用代码', value: num(coverage.without_credit_code), unit: '条', sub: '公开名录未披露该字段时不推测', asOf: coverage.as_of || '', source: '官方公开名录', warn: Number(coverage.without_credit_code) > 0 })}
+    ${metric({ label: '原表信用代码异常', value: num(coverage.with_invalid_credit_code), unit: '条', sub: '字段级非阻塞：原始值保留、标准代码留空、企业仍计入', asOf: coverage.as_of || '', source: '官方公开名录', warn: Number(coverage.with_invalid_credit_code) > 0 })}
   </div>
 
   ${card({
@@ -1070,9 +1241,13 @@ async function renderIntentions(body, q) {
   const fetchLimit = 2000;
   const limit = 200;
   const offset = Math.max(0, Number(q.offset) || 0);
-  const data = await api(`/api/v2/cea/intentions?${qs({ direction, quota_year: quotaYear, from, to, limit: fetchLimit })}`);
+  const [data, options] = await Promise.all([
+    api(`/api/v2/cea/intentions?${qs({ direction, quota_year: quotaYear, from, to, limit: fetchLimit })}`),
+    loadFormOptions(api).catch(() => fallbackFormOptions()),
+  ]);
   const all = data.rows || [];
   const rows = all.slice(offset, offset + limit);
+  const quotaYears = options.cea.years.intentions;
 
   body.innerHTML = `
   <div class="callout callout-warn">
@@ -1083,9 +1258,10 @@ async function renderIntentions(body, q) {
   </div>
 
   <div class="filters">
-    <label class="fld"><span>方向</span><select data-f="direction"><option value="">全部</option>
-      ${Object.entries(DIRECTION_LABEL).map(([k, l]) => `<option value="${k}" ${direction === k ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select></label>
-    <label class="fld"><span>配额年度</span><input type="number" data-f="quota_year" value="${esc(quotaYear)}" min="2000" max="2100" placeholder="如 2026"></label>
+    <label class="fld"><span>方向</span><select data-f="direction">${selectOptionsHtml(
+      Object.entries(DIRECTION_LABEL).map(([value, label]) => ({ value, label })), direction, { allLabel: '全部方向' },
+    )}</select></label>
+    <label class="fld"><span>配额年度</span><select data-f="quota_year">${selectOptionsHtml(quotaYears, quotaYear, { allLabel: '全部年度' })}</select></label>
     <label class="fld"><span>发布日期起</span><input type="date" data-f="from" value="${esc(from)}"></label>
     <label class="fld"><span>止</span><input type="date" data-f="to" value="${esc(to)}"></label>
     <span class="fld-actions">${exportLinks('intentions', { direction, quota_year: quotaYear, from, to })}<button class="btn btn-sm" data-reset>重置</button></span>
@@ -1631,7 +1807,10 @@ async function renderResearch(body, q) {
   const viewpoint = q.viewpoint || '';
   const keyword = q.q || '';
   const issuer = q.issuer || '';
-  const data = await api(`/api/v2/cea/research?${qs({ doc_type: docType, viewpoint, q: keyword, issuer, limit: 100 })}`);
+  const [data, options] = await Promise.all([
+    api(`/api/v2/cea/research?${qs({ doc_type: docType, viewpoint, q: keyword, issuer, limit: 100 })}`),
+    loadFormOptions(api).catch(() => fallbackFormOptions()),
+  ]);
   const rows = data.rows || [];
   const gaps = data.open_gaps || [];
   const isRepost = (r) => String(r.discovery?.source_kind || '') === 'media_repost';
@@ -1644,7 +1823,8 @@ async function renderResearch(body, q) {
       <option value="news" ${docType === 'news' ? 'selected' : ''}>行业动态</option></select></label>
     <label class="fld"><span>观点标记</span><select data-f="viewpoint"><option value="">全部</option>
       ${Object.entries(VIEWPOINT_LABEL).map(([k, l]) => `<option value="${k}" ${viewpoint === k ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select></label>
-    <label class="fld"><span>机构</span><input type="search" data-f="issuer" value="${esc(issuer)}" placeholder="如 上海环境能源交易所"></label>
+    <label class="fld"><span>机构</span><input type="search" data-f="issuer" value="${esc(issuer)}" placeholder="如 上海环境能源交易所" list="cea-issuer-options">
+      ${datalistHtml('cea-issuer-options', options.cea.issuers, issuer)}</label>
     <span class="fld-actions">${exportLinks('research', { doc_type: docType, viewpoint })}<button class="btn btn-sm" data-reset>重置</button></span>
   </div>
 

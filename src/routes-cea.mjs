@@ -23,6 +23,7 @@ import { writeGuard, readGuard } from './services/http-guard.mjs';
 import { requireRole } from './services/project-svc.mjs';
 import { buildExport } from './services/export-svc.mjs';
 import * as cea from './services/cea-svc.mjs';
+import * as marketCandidate from './services/market-candidate-svc.mjs';
 import * as ceaCollect from './services/cea-collect-svc.mjs';
 import { guardCeaParams, CEA_LIMITS, CEA_DATASETS, CEA_FORMATS, CEA_GRANULARITY } from './services/cea-api-params.mjs';
 import { parseCeaDailyReport } from './services/cea-parse.mjs';
@@ -271,6 +272,23 @@ export const CEA_RAW_ROUTES = [
     })
   ))],
 
+  ['GET', '/api/v2/cea/entities/:id', readOnly(async (ctx) => {
+    const out = cea.getCeaEntityProfile(ctx.params.id);
+    if (!out) return { status: 404, body: { error: '未找到该企业档案' } };
+    return out;
+  })],
+
+  ['POST', '/api/v2/admin/cea/entities/:id/aliases', async (ctx) => {
+    const g = writeGuard(ctx); if (g) return { status: g.status, body: g };
+    const denied = requireRole(ctx.user, ['admin'], '维护企业别名'); if (denied) return { status: denied.status, body: denied };
+    const b = ctx.body || {};
+    const out = cea.addCeaEntityAlias(ctx.user, {
+      entityId: ctx.params.id, alias: b.alias, sourceCode: b.source_code || null,
+      sourceUrl: b.source_url || null, evidenceNote: b.evidence_note || null,
+    });
+    return out.error ? { status: out.status || 400, body: out } : out;
+  }],
+
   ['GET', '/api/v2/cea/intentions', readOnly(validated(
     {
       dates: DATE_RANGE, range: DATE_RANGE,
@@ -411,6 +429,55 @@ export const CEA_RAW_ROUTES = [
       missing_reason: usable.length ? null : '库中没有 CCER 独立交易行情记录（market=CCER 且 session_state=traded）',
     };
   })],
+
+  /* ===================== 管理员：第三方行情候选 ===================== */
+  // 候选独立表；本组接口不触碰 cea_trade_daily。普通用户/viewer 由统一后台守卫 403。
+  ['GET', '/api/v2/admin/market-candidates', async (ctx) => {
+    const g = readGuard(); if (g) return { status: g.status, body: g };
+    const denied = requireRole(ctx.user, ['admin'], '查看第三方行情候选'); if (denied) return { status: denied.status, body: denied };
+    return {
+      ok: true,
+      imports: marketCandidate.listMarketCandidateImports({ limit: ctx.query.limit }),
+      rows: marketCandidate.listMarketCandidates({
+        importId: ctx.query.import_id || null,
+        status: ctx.query.status || null,
+        limit: ctx.query.row_limit,
+      }),
+      limits: marketCandidate.MARKET_CANDIDATE_LIMITS,
+      note: '第三方候选只用于差异报告；不写官方行情，不以均价补收盘价。',
+    };
+  }],
+
+  ['POST', '/api/v2/admin/market-candidates/import', async (ctx) => {
+    const g = writeGuard(ctx); if (g) return { status: g.status, body: g };
+    const denied = requireRole(ctx.user, ['admin'], '导入第三方行情候选'); if (denied) return { status: denied.status, body: denied };
+    const b = ctx.body || {};
+    const out = marketCandidate.importMarketCandidates({
+      user: ctx.user,
+      text: b.text,
+      format: String(b.format || 'csv').toLowerCase(),
+      sourceName: b.source_name || null,
+      sourceUrl: b.source_url || null,
+      asOf: b.as_of || null,
+      fileName: b.file_name || null,
+      stale: b.stale === true,
+    });
+    return out.error ? { status: out.status || 400, body: out } : out;
+  }],
+
+  ['GET', '/api/v2/admin/market-candidates/export', async (ctx) => {
+    const g = readGuard(); if (g) return { status: g.status, body: g };
+    const denied = requireRole(ctx.user, ['admin'], '导出行情候选差异'); if (denied) return { status: denied.status, body: denied };
+    const format = ['csv', 'json', 'xlsx'].includes(fmt(ctx.query)) ? fmt(ctx.query) : 'csv';
+    const exported = marketCandidate.marketCandidateExport({
+      importId: ctx.query.import_id || null, status: ctx.query.status || null,
+    });
+    return exportResponse(ctx, {
+      dataset: 'market_candidates', fileBase: 'cea_market_candidates', format,
+      columns: exported.columns, rows: exported.rows, meta: exported.meta,
+      filters: { import_id: ctx.query.import_id || null, status: ctx.query.status || null },
+    });
+  }],
 
   /* ===================== 管理员：配置 / 采集 / 任务 ===================== */
 

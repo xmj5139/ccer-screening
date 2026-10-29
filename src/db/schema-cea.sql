@@ -245,6 +245,8 @@ CREATE TABLE IF NOT EXISTS cea_entity (
   entity_key        TEXT NOT NULL,              -- COALESCE(credit_code, 'name:'||name)
   name              TEXT NOT NULL,
   credit_code       TEXT,                       -- 统一社会信用代码（未披露为 NULL，不推测）
+  raw_credit_code   TEXT,                       -- 原表信用代码（含异常值），不猜测补齐
+  credit_code_valid INTEGER,                    -- 1=18位校验通过；0/NULL=未通过或未披露
   province          TEXT,
   city              TEXT,
   sector            TEXT,                       -- 行业

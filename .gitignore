@@ -2,6 +2,7 @@
 /data/
 /logs/
 /output/
+/outputs/
 /node_modules/
 /.graphflow/
 /.graphflow-cache/
@@ -9,6 +10,7 @@
 /.dsh/
 .env
 .env.*
+!.env.example
 *.db
 *.db-*
 *.sqlite
@@ -25,11 +27,17 @@
 *.tar.gz
 *.zip
 
-# Generated reports, screenshots and scratch exports
+# Track Markdown engineering documents and ADRs, not source PDFs or renders.
 /docs/*
 !/docs/*.md
+!/docs/decisions/
+/docs/decisions/*
+!/docs/decisions/*.md
 __pycache__/
-*.pyc
+*.py[cod]
+.vscode/
+.idea/
+*.swp
 .DS_Store
 Thumbs.db
 desktop.ini

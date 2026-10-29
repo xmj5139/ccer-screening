@@ -1080,10 +1080,13 @@ export function verificationStats() {
  * @param {string} itemId
  * @param {{actor?:string, cfg?:object, force?:boolean}} [opts]
  */
-export async function verifyContentItem(itemId, { actor = 'system:auto-verify', cfg = verifyConfig(), force = false } = {}) {
-  ensureBuiltinRules();
+/**
+ * 当前 content_item 的核验输入与哈希（只读准备；不调用模型、不写 verification_result）。
+ * 供 verifyContentItem 与治理阶段读取共用，避免“时间较新但输入哈希属于旧正文”被当成有效核验。
+ */
+export function contentVerificationInput(itemId, { cfg = verifyConfig() } = {}) {
   const item = get('SELECT * FROM content_item WHERE id=?', [itemId]);
-  if (!item) return { error: '内容条目不存在', status: 404 };
+  if (!item) return null;
 
   const links = all('SELECT * FROM content_source_link WHERE content_item_id=?', [itemId]);
   const provider = pickVerifyProvider(cfg);
@@ -1138,7 +1141,20 @@ export async function verifyContentItem(itemId, { actor = 'system:auto-verify', 
     model: { key: modelKey },
     evidence_version: evidenceHash,
   };
-  const inputHash = buildInputHash(input);
+  return {
+    item, links, provider, evidenceLevel, secondSources, crossSourceVerified, evidence,
+    policyHash, modelKey, evidenceHash, input, inputHash: buildInputHash(input),
+  };
+}
+
+export async function verifyContentItem(itemId, { actor = 'system:auto-verify', cfg = verifyConfig(), force = false } = {}) {
+  ensureBuiltinRules();
+  const prepared = contentVerificationInput(itemId, { cfg });
+  if (!prepared) return { error: '内容条目不存在', status: 404 };
+  const {
+    item, links, provider, evidenceLevel, secondSources, crossSourceVerified,
+    policyHash, modelKey, evidenceHash, input, inputHash, evidence,
+  } = prepared;
   const cacheOpts = { policyHash, modelKey };
 
   if (!force) {
@@ -1770,26 +1786,42 @@ export function buildObjectInput(objectType, obj) {
 }
 
 /**
- * 核验任意受支持的公开对象（政策 / 方法学 / 公开项目）。
- * 与 content_item 共用四态、缓存键（策略+模型+证据）与外发出口。
+ * 当前公开对象的核验输入与签名（只读；供 verifyObject 与版本关系确认共用）。
+ * 关系确认必须使用“当前输入哈希”，历史 verified 记录不能证明更新后的正文。
  */
-export async function verifyObject(objectType, objectId, { actor = 'system:auto-verify', cfg = verifyConfig(), force = false, timeoutMs = null, maxTokens = null } = {}) {
-  ensureBuiltinRules();
+export function objectVerificationInput(objectType, objectId, { cfg = verifyConfig() } = {}) {
   const loader = OBJECT_LOADERS[objectType];
-  if (!loader) return { error: `不支持的核验对象类型：${objectType}`, status: 400 };
+  if (!loader) return null;
   const obj = loader(objectId);
-  if (!obj) return { error: '核验对象不存在', status: 404 };
-  if (objectType === 'public_project' && Number(obj.is_demo || 0) === 1) {
-    return { ok: true, skipped: true, reason: 'demo_excluded', label: '演示条目不参与核验' };
-  }
-
+  if (!obj) return null;
   const provider = pickVerifyProvider(cfg);
   const input = buildObjectInput(objectType, obj);
   const policyHash = policyHashOf(cfg);
   const modelKey = modelKeyOf(provider);
   const evidenceHash = evidenceHashOf({ body: input.body_excerpt, summary: input.summary || '', body_availability: input.body_availability });
   const hashInput = { scheme: INPUT_HASH_SCHEME, ...input, policy: { hash: policyHash }, model: { key: modelKey }, evidence_version: evidenceHash };
-  const inputHash = buildInputHash(hashInput);
+  return {
+    obj, provider, input, policyHash, modelKey, evidenceHash,
+    inputHash: buildInputHash(hashInput),
+  };
+}
+
+/**
+ * 核验任意受支持的公开对象（政策 / 方法学 / 公开项目）。
+ * 与 content_item 共用四态、缓存键（策略+模型+证据）与外发出口。
+ */
+export async function verifyObject(objectType, objectId, { actor = 'system:auto-verify', cfg = verifyConfig(), force = false, timeoutMs = null, maxTokens = null } = {}) {
+  ensureBuiltinRules();
+  const prepared = objectVerificationInput(objectType, objectId, { cfg });
+  if (!prepared) {
+    const loader = OBJECT_LOADERS[objectType];
+    if (!loader) return { error: `不支持的核验对象类型：${objectType}`, status: 400 };
+    return { error: '核验对象不存在', status: 404 };
+  }
+  const { obj, provider, input, policyHash, modelKey, evidenceHash, inputHash } = prepared;
+  if (objectType === 'public_project' && Number(obj.is_demo || 0) === 1) {
+    return { ok: true, skipped: true, reason: 'demo_excluded', label: '演示条目不参与核验' };
+  }
 
   if (!force) {
     const prev = cachedVerification(objectType, objectId, inputHash, { policyHash, modelKey });
@@ -1952,12 +1984,15 @@ export function objectsToVerify(scope, limit = 50) {
   return [];
 }
 
-/** 统一批量核验：按策略里的 scopes 覆盖 内容/政策/方法学/项目/CEA */
-export async function verifyAllBatch({ actor = 'system:auto-verify', limitPerScope = null, cfg = verifyConfig() } = {}) {
+/** 统一批量核验：按策略里的 scopes 覆盖 内容/政策/方法学/项目/CEA。
+ * includeContent=false 时把内容核验留给治理阶段（按 attempts/next_retry 限流），
+ * 其它对象仍按原批处理；默认 true 保持既有调用方行为。
+ */
+export async function verifyAllBatch({ actor = 'system:auto-verify', limitPerScope = null, cfg = verifyConfig(), includeContent = true } = {}) {
   const per = Math.min(Number(limitPerScope) || cfg.max_per_run || 40, 200);
   const out = { scopes: {}, content: null };
   const scopes = Array.isArray(cfg.scopes) && cfg.scopes.length ? cfg.scopes : ['content'];
-  if (scopes.includes('content')) out.content = await verifyContentBatch({ actor, limit: per });
+  if (includeContent && scopes.includes('content')) out.content = await verifyContentBatch({ actor, limit: per });
   for (const scope of scopes.filter((s) => s !== 'content')) {
     const type = {
       policy: 'policy_document', methodology: 'methodology_version', project: 'public_project', cea: 'cea_document',

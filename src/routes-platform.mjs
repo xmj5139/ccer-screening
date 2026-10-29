@@ -24,6 +24,9 @@ import * as maint from './services/admin-maintenance-svc.mjs';
 import * as market from './services/market-summary-svc.mjs';
 import * as deepseek from './services/deepseek-capability-svc.mjs';
 import { seedOfficialDomains } from './services/source-display-svc.mjs';
+import * as gapTriage from './services/gap-triage-svc.mjs';
+import * as ingestSummary from './services/ingest-summary-svc.mjs';
+import { refreshSearchEntity } from './services/search-index-svc.mjs';
 
 /** 统一包装：把服务返回的 { error, status } 转成路由信封 */
 function envelope(out) {
@@ -144,6 +147,53 @@ export const PLATFORM_RAW_ROUTES = [
     return envelope(maint.gapReasons(ctx.user, { status: ctx.query.status || 'all' }));
   }],
 
+  ['GET', '/api/v2/admin/maintenance/gaps/triage', async (ctx) => {
+    const g = readGuard();
+    if (g) return { status: g.status, body: g };
+    const denied = adminOnly(ctx, '查看缺口分类');
+    if (denied) return { status: denied.status, body: denied };
+    return gapTriage.triageGaps({
+      status: ctx.query.status || 'all',
+      limit: Number(ctx.query.limit) || 300,
+      persist: false,
+    });
+  }],
+
+  ['POST', '/api/v2/admin/maintenance/gaps/triage', async (ctx) => {
+    const g = writeGuard(ctx);
+    if (g) return { status: g.status, body: g };
+    const denied = adminOnly(ctx, '重新分类缺口');
+    if (denied) return { status: denied.status, body: denied };
+    return gapTriage.triageGaps({
+      status: ctx.body?.status || 'all',
+      limit: Number(ctx.body?.limit) || 300,
+      persist: true,
+    });
+  }],
+
+  ['POST', '/api/v2/admin/maintenance/gaps/:id/action', async (ctx) => {
+    const g = writeGuard(ctx);
+    if (g) return { status: g.status, body: g };
+    const denied = adminOnly(ctx, '执行缺口受控动作');
+    if (denied) return { status: denied.status, body: denied };
+    const b = ctx.body || {};
+    return envelope(await gapTriage.runGapAction(ctx.user, ctx.params.id, b.action, {
+      actorNote: b.note || null,
+    }));
+  }],
+
+  ['GET', '/api/v2/admin/maintenance/cea-exclusions', async (ctx) => {
+    const g = readGuard();
+    if (g) return { status: g.status, body: g };
+    const denied = adminOnly(ctx, '查看 CEA 非目标页排除记录');
+    if (denied) return { status: denied.status, body: denied };
+    const cea = await import('./services/cea-svc.mjs');
+    return {
+      exclusions: cea.listCeaPageExclusions({ limit: Number(ctx.query.limit) || 100 }),
+      note: '仅记录标题/主内容确定性规则判定的非目标页；未知/空/访问失败不在此列。',
+    };
+  }],
+
   ['POST', '/api/v2/admin/maintenance/retry', async (ctx) => {
     const g = writeGuard(ctx);
     if (g) return { status: g.status, body: g };
@@ -178,9 +228,18 @@ export const PLATFORM_RAW_ROUTES = [
     const denied = adminOnly(ctx, '编辑公开内容');
     if (denied) return { status: denied.status, body: denied };
     const b = ctx.body || {};
-    return envelope(maint.applyEdit(ctx.user, {
+    const out = maint.applyEdit(ctx.user, {
       entity_type: b.entity_type, entity_id: b.entity_id, fields: b.fields, note: b.note || null,
-    }));
+    });
+    // 管理覆盖层变化后，如果 FTS 已完整构建，则同步单条刷新公开检索结果。
+    const searchType = {
+      policy_document: 'policy', methodology_version: 'methodology', public_project: 'project',
+      content_item: 'content', cea_document: 'cea_document', emission_factor: 'factor',
+    }[String(b.entity_type || '')];
+    if (searchType && b.entity_id && !out?.error) {
+      try { refreshSearchEntity(searchType, b.entity_id, { actor: ctx.user.name || 'admin' }); } catch { /* 可由后台重建 */ }
+    }
+    return envelope(out);
   }],
 
   ['GET', '/api/v2/admin/maintenance/revisions', async (ctx) => {
@@ -237,6 +296,46 @@ export const PLATFORM_RAW_ROUTES = [
     const denied = adminOnly(ctx, '查看摘要状态');
     if (denied) return { status: denied.status, body: denied };
     return envelope(summary.summaryStatus({ sample: Number(ctx.query.sample) || undefined }));
+  }],
+
+  ['GET', '/api/v2/admin/summaries/queue', async (ctx) => {
+    const g = readGuard();
+    if (g) return { status: g.status, body: g };
+    const denied = adminOnly(ctx, '查看入库摘要队列');
+    if (denied) return { status: denied.status, body: denied };
+    return ingestSummary.ingestQueueStatus({ limit: Number(ctx.query.limit) || 20 });
+  }],
+
+  ['POST', '/api/v2/admin/summaries/queue/toggle', async (ctx) => {
+    const g = writeGuard(ctx);
+    if (g) return { status: g.status, body: g };
+    const denied = adminOnly(ctx, '切换入库摘要队列');
+    if (denied) return { status: denied.status, body: denied };
+    return envelope(ingestSummary.setIngestWorkerEnabled(ctx.user, ctx.body?.enabled !== false));
+  }],
+
+  ['POST', '/api/v2/admin/summaries/queue/retry', async (ctx) => {
+    const g = writeGuard(ctx);
+    if (g) return { status: g.status, body: g };
+    const denied = adminOnly(ctx, '重试入库摘要任务');
+    if (denied) return { status: denied.status, body: denied };
+    return envelope(ingestSummary.retryIngestTasks(ctx.user, {
+      ids: Array.isArray(ctx.body?.ids) ? ctx.body.ids : null,
+      limit: Number(ctx.body?.limit) || 5,
+    }));
+  }],
+
+  ['POST', '/api/v2/admin/summaries/queue/backfill', async (ctx) => {
+    const g = writeGuard(ctx);
+    if (g) return { status: g.status, body: g };
+    const denied = adminOnly(ctx, '补入漏队摘要任务');
+    if (denied) return { status: denied.status, body: denied };
+    const out = ingestSummary.enqueueMissedContentSummaries({
+      limit: Number(ctx.body?.limit) || 20,
+      actor: ctx.user.name || 'admin',
+      source: 'admin_backfill',
+    });
+    return { ok: true, ...out, queue_status: ingestSummary.ingestQueueStatus({ limit: 15 }) };
   }],
 
   /**

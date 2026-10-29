@@ -81,6 +81,26 @@ export function sha256(buf) {
   return createHash('sha256').update(buf).digest('hex');
 }
 
+/** 读取响应体并在超过上限时中止（RSS/XML 等外部小文件）。 */
+async function readBodyLimited(res, limitBytes) {
+  const limit = Math.max(1024, Number(limitBytes) || 1024);
+  const reader = res.body?.getReader?.();
+  if (!reader) return Buffer.from(await res.arrayBuffer());
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value?.length || 0;
+    if (total > limit) {
+      try { await reader.cancel(); } catch { /* ignore */ }
+      return { tooLarge: true, bytes: total };
+    }
+    chunks.push(Buffer.from(value));
+  }
+  return Buffer.concat(chunks);
+}
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
@@ -116,6 +136,7 @@ export async function fetchText(url, opts = {}) {
     body = null,
     userAgent = USER_AGENT,
     deadlineAt = null,
+    maxBytes = null,
   } = opts;
   const check = checkOutboundUrl(url, allowedDomains);
   if (!check.ok) return { ok: false, error: check.reason, blocked: true };
@@ -151,7 +172,16 @@ export async function fetchText(url, opts = {}) {
         body,
         signal: AbortSignal.timeout(attemptTimeout),
       });
-      const buf = Buffer.from(await res.arrayBuffer());
+      const buf = maxBytes
+        ? await readBodyLimited(res, Number(maxBytes))
+        : Buffer.from(await res.arrayBuffer());
+      if (buf?.tooLarge) {
+        return {
+          ok: false, status: res.status, reason: 'too_large',
+          error: `响应超过大小上限 ${Number(maxBytes)} 字节，已中止读取`,
+          elapsed_ms: Date.now() - started, attempts: attempt,
+        };
+      }
       const elapsed = Date.now() - started;
       let text = buf.toString('utf8');
       const head = text.slice(0, 800);
@@ -1208,6 +1238,21 @@ export async function runDailyJob(opts = {}) {
     projectMaxDetails = 500, projectArchiveFiles = !!process.env.CCER_REGISTRY_COOKIE,
     contentMaxItems = 30, contentWindowDays = 7, evidenceLoop = true,
   } = opts;
+  // 每日任务与历史补采共用 collection 租约：单任务并发 1，租约未到期不抢占。
+  // 管理员可能正在跑历史补采；此时每日任务如实跳过，不并行打满小服务器。
+  const governance = await import('./governance-svc.mjs');
+  governance.reapExpiredLease('collection');
+  const leaseOwner = `daily:${process.pid}:${Date.now()}`;
+  const lease = governance.acquireLease({
+    key: 'collection', owner: leaseOwner, purpose: `daily:${trigger}`,
+  });
+  if (!lease.ok) {
+    return {
+      ok: false, status: 'skipped', reason: 'lease_busy', skipped: true,
+      message: '已有采集/补采任务持有 collection 租约，本次每日任务未启动；租约到期后可重试。',
+      lease: lease.lease || null,
+    };
+  }
   const stats = { found: 0, parsed: 0, validated: 0, queued: 0, published: 0, errors: 0 };
   const jobId = startJob({
     job_key: JOB_KINDS[jobKey] ? jobKey : 'daily_all',
@@ -1216,7 +1261,7 @@ export async function runDailyJob(opts = {}) {
     triggered_by: actor,
     datasets,
   });
-  const detail = {};
+  const detail = { lease: { key: 'collection', owner: leaseOwner } };
   let dataAsOf = null;
 
   try {
@@ -1304,6 +1349,43 @@ export async function runDailyJob(opts = {}) {
         // 种子来源有可用连接却全部抓取失败 → 才算故障
         if (seed.ok === false && seed.reason !== 'no_fetch_connection') stats.errors += 1;
         if (seed.reason === 'no_fetch_connection') detail.content_seed_not_configured = seed.message;
+        // RSS/Atom 每日有界发现：只处理启用的来源与有限条目，正文抓取仍走既有链路。
+        try {
+          const rss = await import('./rss-discovery-svc.mjs');
+          const r = await rss.runRssDaily({
+            actor, maxSources: 5, maxItems: 20, maxFetch: 3,
+            deadlineAt: Date.now() + 60000,
+          });
+          detail.rss = r;
+          stats.found += r.discovered || 0;
+          stats.parsed += r.inserted || 0;
+          stats.published += r.inserted || 0;
+          if (!r.ok && (r.sources || 0) > 0) stats.errors += 1;
+        } catch (e) {
+          detail.rss = { ok: false, error: e.message };
+          stats.errors += 1;
+        }
+        // 全文索引增量：只在已完整构建过索引时做有限批次刷新；
+        // 未构建时交给后台显式重建，避免每日任务隐式全库重建。
+        try {
+          const idx = await import('./search-index-svc.mjs');
+          const st = idx.searchIndexStatus();
+          if (st.ready) {
+            // 每类型旋转游标：旧 ID 的更新不会被 offset=0 永久漏掉。
+            const built = idx.buildSearchIndex({
+              maxDocs: 300, rotate: true, actor: 'system:daily-search-index',
+            });
+            detail.search_index = {
+              ok: true, inserted: built.inserted, updated: built.updated,
+              skipped: built.skipped, removed: built.removed, truncated: built.truncated,
+              rotate: true,
+            };
+          } else {
+            detail.search_index = { ok: true, skipped: true, reason: 'index_not_built', note: st.note };
+          }
+        } catch (e) {
+          detail.search_index = { ok: false, error: e.message };
+        }
       } catch (e) {
         stats.errors += 1;
         detail.content = { ok: false, error: e.message };
@@ -1351,16 +1433,18 @@ export async function runDailyJob(opts = {}) {
       detail.region_map = { ok: false, status: 'failed', error: e.message };
     }
     // 统一模型核验：内容（研报/动态）+ 政策 + 方法学 + 公开项目，共用同一套四态与缓存键。
-    // unavailable 不缓存：模型配置好之后同一内容会在此自动重试。
+    // docs/76：每日链路不再直接 verifyAllBatch 旁路重试，具体逐条调度放到下方
+    // governance.runDailyGovernance（共享阶段尝试上限/退避/租约）。
     if (datasets.includes('verify')) {
       try {
         const verify = await import('./verification-svc.mjs');
-        const v = await verify.verifyAllBatch({ actor, limitPerScope: contentMaxItems });
-        detail.verify = v;
-        const counted = Object.values(v.scopes || {}).reduce((s, t) => s + (t.verified || 0) + (t.insufficient || 0) + (t.conflict || 0) + (t.unavailable || 0), 0);
-        stats.validated += counted + (v.content ? Object.values(v.content).reduce((s, n) => s + (typeof n === 'number' ? n : 0), 0) : 0);
+        const vcfg = verify.verifyConfig();
+        detail.verify = {
+          mode: 'governance_bounded',
+          scopes: vcfg.scopes,
+          note: '每日核验统一由治理阶段按 attempts/next_retry 调度，旧 verifyAllBatch 仅保留公开 API。',
+        };
       } catch (e) {
-        stats.errors += 1;
         detail.verify = { ok: false, error: e.message };
       }
     }
@@ -1419,8 +1503,14 @@ export async function runDailyJob(opts = {}) {
               detail.policy_archive_gap = archiveSvc.syncPolicyArchiveGap({ actor });
             }
             if (datasets.includes('verify')) {
-              const verify = await import('./verification-svc.mjs');
-              detail.evidence_loop_verify = await verify.verifyAllBatch({ actor, limitPerScope: contentMaxItems });
+              // 证据循环的复核也走同一治理 worker：attempts/next_retry/租约统一生效，
+              // 不再直接调用旧 verifyAllBatch 绕过退避。
+              const governance = await import('./governance-svc.mjs');
+              detail.evidence_loop_governance = await governance.runDailyGovernance({
+                actor,
+                limit: Number(process.env.CCER_GOVERNANCE_MAX_BATCH || 20),
+                budgetMs: Number(process.env.CCER_GOVERNANCE_BUDGET_MS || 60000),
+              });
               const ai = await import('./reconciliation-ai-svc.mjs');
               detail.evidence_loop_ai = await ai.calibrateOpenIssues({ actor, limit: 60 });
             }
@@ -1431,27 +1521,58 @@ export async function runDailyJob(opts = {}) {
         detail.evidence_loop = { error: e.message, stop_reason: '循环执行异常，已停止；原始数据未覆盖' };
       }
     }
-    // 核心摘要的**有界**刷新（docs/44 第 3 条）：日更新后只补少量最新条目，
-    // 不阻塞每日任务主体；未配置模型时如实记为 skipped，绝不伪造「模型生成」。
+    // 每日摘要/核验统一进入治理 worker（docs/76）：不再调用旧 refreshAfterDaily
+    // 对所有类型旁路生成；排放因子不属于逐条五阶段，仍按其既有摘要适配器有界补齐。
     if (datasets.includes('content') || datasets.includes('policy')) {
       try {
         const summary = await import('./summary-svc.mjs');
-        const r = await summary.refreshAfterDaily({
-          limit: Number(process.env.CCER_SUMMARY_DAILY_LIMIT || 6),
+        const r = await summary.runSummaryBatchExclusive({
+          entityType: 'emission_factor',
+          limit: 2,
           budgetMs: Number(process.env.CCER_SUMMARY_DAILY_BUDGET_MS || 60000),
           actor: 'system:daily',
         });
-        detail.summaries = r;
+        detail.factor_summary = r;
+      } catch (e) {
+        detail.factor_summary = { ok: false, error: e.message };
+      }
+    }
+    // 信息治理：每日采集后自动处理符合条件的待摘要/待核验记录（有界、退避、尝试上限）。
+    // 所有受治理类型都经同一 worker；核验 scope 仍由自动核验策略控制。
+    if (datasets.some((d) => ['content', 'policy', 'project', 'trade', 'verify'].includes(d))) {
+      try {
+        detail.governance = await governance.runDailyGovernance({
+          actor: 'system:daily',
+          limit: Number(process.env.CCER_GOVERNANCE_MAX_BATCH || 20),
+          budgetMs: Number(process.env.CCER_GOVERNANCE_BUDGET_MS || 60000),
+        });
+        detail.summaries = {
+          mode: 'governance_bounded',
+          summarized: Number(detail.governance.summarized || 0),
+          blocked: Number(detail.governance.blocked || 0),
+          failed: Number(detail.governance.failed || 0),
+          skipped: Number(detail.governance.skipped || 0),
+          factor: detail.factor_summary || null,
+        };
+        detail.verify_content_via_governance = (detail.governance.verify_object_types || []).includes('content_item');
+        stats.validated += Number(detail.governance.verified || 0) + Number(detail.governance.summarized || 0);
         addStep(jobId, 9100, {
-          stage: 'summarize', target: 'entity_summary', status: r.ok === false ? 'failed' : 'ok',
-          items: Number(r.generated || 0),
-          message: r.model_configured === false
-            ? '未配置可用模型：本次未生成摘要（不伪造模型生成）'
-            : `核心摘要：生成 ${r.generated || 0} 条，跳过 ${r.skipped || 0} 条，失败 ${r.failed || 0} 条`,
+          stage: 'summarize', target: 'entity_summary',
+          status: detail.governance.failed ? 'failed' : 'ok',
+          items: Number(detail.governance.summarized || 0),
+          message: detail.governance.by_type?.content_item || detail.governance.by_type?.policy_document
+            ? `治理摘要：生成 ${detail.governance.summarized || 0} 条，阻塞 ${detail.governance.blocked || 0} 条，失败 ${detail.governance.failed || 0} 条`
+            : '本轮无待摘要记录',
+        });
+        addStep(jobId, 9200, {
+          stage: 'governance', target: 'processing_stage',
+          status: detail.governance.failed ? 'failed' : 'ok',
+          items: Number(detail.governance.summarized || 0) + Number(detail.governance.verified || 0),
+          message: `治理补处理：摘要 ${detail.governance.summarized || 0}、核验 ${detail.governance.verified || 0}、` +
+            `阻塞 ${detail.governance.blocked || 0}、失败 ${detail.governance.failed || 0}`,
         });
       } catch (e) {
-        // 摘要刷新失败不影响每日任务整体结果
-        detail.summaries = { ok: false, error: e.message };
+        detail.governance = { ok: false, error: e.message };
       }
     }
 
@@ -1468,11 +1589,13 @@ export async function runDailyJob(opts = {}) {
       dataAsOf,
       detail,
     });
+    governance.releaseLease({ key: 'collection', owner: leaseOwner });
     return { ok: status !== 'failed', job_id: jobId, status, stats, detail };
   } catch (e) {
     stats.errors += 1;
     addStep(jobId, 9999, { stage: 'publish', target: 'job', status: 'failed', message: e.message });
     finishJob(jobId, { status: 'failed', stats, errorSummary: e.message, dataAsOf, detail });
+    governance.releaseLease({ key: 'collection', owner: leaseOwner });
     return { ok: false, job_id: jobId, status: 'failed', stats, error: e.message, detail };
   }
 }
@@ -1498,7 +1621,7 @@ export function listDatasetCursors() {
     note: r.note,
   }));
   // 没有游标记录的数据集也要如实显示「从未成功」
-  for (const d of [...DAILY_DATASETS, 'content_discovery', 'content_seed', 'seed_source_probe', 'verify_content', 'verify_policy', 'verify_methodology', 'verify_project']) {
+  for (const d of [...DAILY_DATASETS, 'content_discovery', 'content_seed', 'seed_source_probe', 'rss_discovery', 'verify_content', 'verify_policy', 'verify_methodology', 'verify_project']) {
     if (!have.has(d)) {
       out.push({
         dataset: d, last_window_from: null, last_window_to: null, last_success_at: null,

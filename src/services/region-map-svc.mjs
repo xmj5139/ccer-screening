@@ -663,6 +663,8 @@ function directoryAggregates(requestedYear = null) {
   const sourceAsOf = new Map();
   const sectorSets = new Map();
   const asOfByYearProvince = new Map();
+  // 省详情里提供少量真实企业入口（只列已收录名录行），可进入企业档案。
+  const entityRowsByYearProvince = new Map();
 
   const addSource = (yearKey, sourceKey, key, day, code, url) => {
     if (!sourceMeta.has(sourceKey)) sourceMeta.set(sourceKey, { source_code: code || null, source_url: url || null });
@@ -709,6 +711,11 @@ function directoryAggregates(requestedYear = null) {
     if (rawLabel) labelCounts.get(code).set(rawLabel, (labelCounts.get(code).get(rawLabel) || 0) + 1);
     if (!byYear.has(yearKeyBase)) byYear.set(yearKeyBase, new Set());
     byYear.get(yearKeyBase).add(key);
+    if (!entityRowsByYearProvince.has(yearKeyBase)) entityRowsByYearProvince.set(yearKeyBase, []);
+    entityRowsByYearProvince.get(yearKeyBase).push({
+      id: row.id, name: row.name, list_year: year, sector: row.sector || null,
+      credit_code: row.credit_code || null,
+    });
     if (!sectorSets.has(yearKeyBase)) sectorSets.set(yearKeyBase, new Set());
     const memberRows = membershipsByEntity.get(row.id) || [];
     const sectors = new Set(sectorSets.get(yearKeyBase));
@@ -789,6 +796,7 @@ function directoryAggregates(requestedYear = null) {
     source_meta: sourceMeta,
     source_as_of: sourceAsOf,
     sector_sets: sectorSets,
+    entity_rows_by_year_province: entityRowsByYearProvince,
     as_of_by_year_province: asOfByYearProvince,
     total_latest_year: totalLatest,
     total_selected_year: totalSelected,
@@ -827,6 +835,12 @@ function directoryRegionDetail(directory, province) {
   const missingSectors = NATIONAL_ETS_SECTORS.filter((s) => !sectors.includes(s)
     && !notApplicable.some((c) => c.sector === s));
   const asOf = key ? directory.as_of_by_year_province.get(key) || null : null;
+  const entities = key
+    ? (directory.entity_rows_by_year_province.get(key) || [])
+      .slice()
+      .sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'zh-CN'))
+      .slice(0, 8)
+    : [];
   const note = count === null || count === 0
     ? `本平台尚未收录该省 ${year || ''} 年名录；不补 0，不代表该省没有重点排放单位。`
     : `本平台已收录该省 ${year} 年名录 ${count} 家；`
@@ -847,6 +861,8 @@ function directoryRegionDetail(directory, province) {
     missing_sectors: missingSectors,
     not_applicable_sectors: notApplicable,
     as_of: asOf,
+    entities,
+    entities_note: entities.length ? '以下为已收录名录中的真实企业，可进入企业档案；不是全省完整名单。' : null,
     province_label: province.name,
     coverage_note: note,
     note,

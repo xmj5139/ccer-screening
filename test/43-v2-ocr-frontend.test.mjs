@@ -128,6 +128,30 @@ const API_FIXTURES = {
       result: { candidates: 2, selected: 2, ok_count: 1, fail_count: 1, ocr_ready: false, ocr_note: 'OCR 未启用', docs: [] },
     }],
   }),
+  // docs/54：OCR 页新增 DeepSeek 视觉补充入口，渲染时会额外读取只读能力状态。
+  '/api/v2/admin/vision/status': () => ({
+    capability: { enabled: false, credential_configured: false, binding_hint: '未绑定官方视觉模型' },
+    pages: [], totals: { total: 0, ok: 0, applied: 0 }, files: [],
+    limits: { max_pages_per_doc: 3, max_image_bytes: 8388608, files_reuse: false },
+  }),
+  '/api/v2/admin/vision/tooling': () => ({
+    tooling: { available: false, error: '未安装 pdftoppm（Poppler）' },
+    capability: { enabled: false }, files: [], agent_hint: '安装 poppler-utils 后可启用指定页视觉补充。',
+  }),
+  '/api/v2/admin/deepseek': () => ({
+    capabilities: ['search', 'fetch', 'vision', 'chat_tools', 'json'].map((kind) => ({
+      kind, label: `${kind} 能力`, enabled: kind === 'json', provider_id: null, provider_name: null,
+      provider_model: null, provider_official: false, credential_configured: false, config: {},
+      daily_quota: 10, max_per_turn: 2, timeout_ms: 30000, calls_today: 0, total_calls: 0,
+      total_success: 0, last_call_at: null, last_success_at: null, last_failure_at: null,
+      last_error: null, budget_stopped_today: false, budget: { state: 'ok', used: 0, quota: 10 },
+    })),
+    providers: [], fallback: { search: [], fetch: [] },
+    search: { primary_count: 0, fallback_count: 0 }, fetch: { primary_count: 0, fallback_count: 0 },
+    file_cache: { total: 0, active: 0 }, vision: { total: 0, ok: 0, applied: 0 },
+    usage: { calls: 0, ok: 0, cache_hit_tokens: 0, cache_miss_tokens: 0, tool_calls: 0, cost_estimated_calls: 0, estimated_cost_cny: 0 },
+    recent_calls: [], tool_calls: { calls: 0, ok: 0 }, pricing_note: '测试夹具', boundary_note: '视觉不是官方事实',
+  }),
 };
 
 const apiCalls = [];
@@ -156,8 +180,9 @@ await testAsync('渲染 tab=ocr：产出配置/配额/能力/缺口/任务五块
   assert(tabsHtml.includes('PDF 解析/OCR'), '顶部页签栏应包含「PDF 解析/OCR」');
   assert(rendered.length > 1500, `渲染结果过短（${rendered.length} 字符），疑似未真正渲染`);
   assertEqual(apiCalls.map((c) => c.url).sort().join(','),
-    ['/api/v2/admin/ocr/config', '/api/v2/admin/ocr/gaps', '/api/v2/admin/ocr/status'].join(','),
-    '应真实请求三个 OCR 接口');
+    ['/api/v2/admin/ocr/config', '/api/v2/admin/ocr/gaps', '/api/v2/admin/ocr/status',
+      '/api/v2/admin/vision/status', '/api/v2/admin/vision/tooling'].join(','),
+    '应真实请求 OCR 与视觉能力接口');
 });
 
 test('渲染内容：页签存在、密钥输入为空且不回填、关键操作按钮齐备', () => {
@@ -182,6 +207,8 @@ test('渲染内容：页签存在、密钥输入为空且不回填、关键操�
   assertIncludes(rendered, 'id="ocr-backfill"');
   assertIncludes(rendered, 'id="ocr-daily"');
   assertIncludes(rendered, 'id="ocr-refresh"');
+  assertIncludes(rendered, 'DeepSeek Flash 视觉补充');
+  assertIncludes(rendered, 'id="vision-form"');
   // 受限根与结果目录如实展示
   assertIncludes(rendered, 'official-originals');
   assertIncludes(rendered, 'registry-files');
@@ -244,5 +271,22 @@ await testAsync('已配置凭据时：只显示「已配置」，且密钥输入
 });
 
 /* ==================================================================== */
+
+await testAsync('DeepSeek 能力页签：可真实渲染引用/预算/观测/视觉入口，不回显凭据', async () => {
+  if (!domReady()) { console.log('  ↷ 本环境未执行 DOM 渲染'); return; }
+  const root = makeEl('div');
+  const tabBody = makeEl('div');
+  globalThis.document.getElementById = (id) => (id === 'tab-body' ? tabBody : makeEl('div'));
+  apiCalls.length = 0;
+  await mod.renderAdmin(root, { query: { tab: 'deepseek' } });
+  const html = tabBody.innerHTML;
+  assertIncludes(html, 'DeepSeek 能力');
+  assertIncludes(html, '能力开关、预算与引用关系');
+  assertIncludes(html, '调用观测');
+  assertIncludes(html, '视觉补充与 Files 复用');
+  assertNotIncludes(html, 'credential_cipher');
+  assertNotIncludes(html, 'DEEPSEEK_API_KEY');
+  assert(apiCalls.some((c) => c.url === '/api/v2/admin/deepseek'), '应真实请求 DeepSeek 概览接口');
+});
 
 finish('43-v2-ocr-frontend.test.mjs');

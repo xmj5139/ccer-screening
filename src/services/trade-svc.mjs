@@ -573,8 +573,10 @@ function calendarCell(date, cal, daily) {
       source: 'official_bulletin',
     };
   }
-  if (cal && (cal.day_type === 'weekend' || dow === 0 || dow === 6)) {
-    return { trade_date: date, state: 'closed', state_label: '周末休市', source: 'calendar' };
+  // 周末是可由日历直接确定的休市，不依赖该日期是否已被写入 trade_calendar。
+  // 工作日没有官方公告只能标「数据暂缺」，不能反推休市。
+  if (dow === 0 || dow === 6 || (cal && cal.day_type === 'weekend')) {
+    return { trade_date: date, state: 'closed', state_label: '周末休市', source: cal ? 'calendar' : 'weekday_rule' };
   }
   if (cal && cal.day_type === 'holiday') {
     return { trade_date: date, state: 'closed', state_label: '休市（已有独立依据）', source: 'calendar_confirmed' };

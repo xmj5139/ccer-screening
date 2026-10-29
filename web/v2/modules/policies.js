@@ -221,7 +221,7 @@ async function renderMethodologyTab(body, q) {
     if (!a) return;
     try {
       const d = await api(`/api/v2/methodologies/${a.dataset.mv}`);
-      showMethodologyDrawer(d);
+      await showMethodologyDrawer(d);
     } catch (err) {
       toast(err.message, 'danger');
     }
@@ -252,8 +252,14 @@ function methodologyTable(title, rows) {
   });
 }
 
-function showMethodologyDrawer(d) {
+async function showMethodologyDrawer(d) {
   const v = d.version;
+  let lineage = null;
+  try {
+    lineage = await api(`/api/v2/methodology-versions/${encodeURIComponent(v.id)}/timeline`);
+  } catch {
+    lineage = null;
+  }
   const gate = d.gate || {};
   const ver = d.verification;
   const rules = (d.rules || []).map((r) => `<tr><td>${esc(r.rule_key)}</td><td>${esc(r.title)}</td><td>${esc(r.layer || '')}</td>
@@ -274,6 +280,47 @@ function showMethodologyDrawer(d) {
     </div>`).join('');
   const blockers = (gate.blockers || []).map((b) => `<li>${esc(b)}</li>`).join('');
   const remaining = (ver?.remaining_blockers || []).map((b) => `<li>${esc(b)}</li>`).join('');
+
+  const lineageEvents = lineage
+    ? lineage.timeline.flatMap((x) => (x.events || []).map((e) => ({
+        ...e,
+        version_label: `${x.code_display || x.version}｜${x.version}`,
+        version_status: x.status_label,
+      }))).sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')))
+    : [];
+  const allRelations = lineage
+    ? lineage.timeline.flatMap((x) => (x.relations || []).map((r) => ({ ...r, version_label: x.version })))
+    : [];
+  const lineageHtml = lineage
+    ? `<div class="version-lineage">
+        <div class="chip-row">
+          <span class="chip chip-ok">正式 ${lineage.formal.length}</span>
+          <span class="chip chip-muted">征求意见/草案 ${lineage.draft.length}</span>
+          <span class="chip chip-muted">当前版本 ${esc(v.version)}</span>
+        </div>
+        ${lineageEvents.length ? `<ol class="version-events">${lineageEvents.map((e) => `<li class="version-event version-event-${esc(e.status)}">
+          <div class="list-head"><b>${esc(e.label)}</b><span class="muted right">${esc(shortDate(e.date))}</span></div>
+          <div class="list-foot"><span class="chip ${e.status === 'confirmed' ? 'chip-ok' : 'chip-muted'}">${esc(e.status_label || (e.status === 'confirmed' ? '已确认' : '记录值'))}</span>
+            <span class="muted">${esc(e.version_label)}</span></div>
+          <p class="muted">原文：${e.official_url ? `<a class="link" href="${esc(e.official_url)}" target="_blank" rel="noopener noreferrer">打开</a>` : '未登记'}｜文件哈希：${esc(e.file_hash || '未登记')}｜日期：${esc(shortDate(e.date))}</p>
+          ${e.evidence_locator ? `<p class="muted">证据定位：${esc(e.evidence_locator)}${e.evidence_quote ? `｜引文：${esc(truncate(e.evidence_quote, 120))}` : ''}</p>` : '<p class="hint">该事件来自结构化日期/状态；未附原文定位，不据此推断其它版本关系。</p>'}
+          ${e.note ? `<p class="muted">${esc(e.note)}</p>` : ''}
+        </li>`).join('')}</ol>` : '<p class="muted">暂无可展示的版本事件。</p>'}
+        ${allRelations.length ? `<h5>版本关系（有证据才确认）</h5><ul class="bullets">${allRelations.slice(0, 12).map((r) => `<li>${esc(r.relation_type_label || r.relation_type)}：${esc(r.from?.code_display || r.from_version_id)} → ${esc(r.to?.code_display || r.to_version_id)}
+          ${r.status === 'confirmed' ? chip('已确认', 'ok') : chip('候选/待核实', 'warn')}
+          ${r.evidence_locator ? `<span class="muted">（${esc(r.evidence_locator)}）</span>` : ''}</li>`).join('')}</ul>` : '<p class="hint">尚无版本关系记录；不按编号相邻推断继承关系。</p>'}
+        <h5>版本差异（来源定位）</h5>
+        <div class="version-diff-controls">
+          <label class="fld"><span>对比版本</span><select id="mv-compare-to">
+            ${lineage.timeline.filter((x) => x.id !== v.id).map((x) => `<option value="${esc(x.id)}">${esc(x.code_display || x.version)}｜${esc(x.status_label)}</option>`).join('') || '<option value="">无可对比版本</option>'}
+          </select></label>
+          <button class="btn btn-sm" id="mv-diff-run" type="button" ${lineage.timeline.length < 2 ? 'disabled' : ''}>比较差异</button>
+        </div>
+        <div id="mv-diff-result" class="version-diff-result"></div>
+        <p class="hint">${esc(lineage.note || '')}</p>
+        ${lineage.timeline.filter((x) => x.calculation_runs > 0).map((x) => `<p class="muted">${esc(x.code_display || x.version)}：${esc(x.calculation_runs_note)}</p>`).join('')}
+      </div>`
+    : '<p class="muted">版本跟踪数据暂不可用；本页仍展示当前版本原文与规则卡，不推测版本关系。</p>';
 
   document.body.insertAdjacentHTML('beforeend', drawer('方法学详情', `
     <h4>${esc(v.code_display || '（编号待核实）')} ${esc(v.version)}｜${esc(v.name)}</h4>
@@ -313,10 +360,39 @@ function showMethodologyDrawer(d) {
     ${formulas ? `<table class="grid grid-sm"><thead><tr><th>编号</th><th>表达式</th><th>条款</th><th>说明</th></tr></thead><tbody>${formulas}</tbody></table>` : '<p class="muted">无公式。</p>'}
     <h5>因子与参数（${(d.factors || []).length} 条）</h5>
     ${factors ? `<table class="grid grid-sm"><thead><tr><th>键</th><th>名称</th><th>值</th><th>单位</th><th>年份</th><th>来源</th><th>状态</th></tr></thead><tbody>${factors}</tbody></table>` : '<p class="muted">无因子。</p>'}
-    <h5>版本历史</h5>
-    <ul class="list">${(d.version_history || []).map((h) => `<li>${esc(h.version)}｜${esc(h.document_status)}｜${esc(shortDate(h.release_date))}</li>`).join('') || '<li class="muted">无</li>'}</ul>
+    <h5>方法学版本跟踪</h5>
+    ${lineageHtml}
     <p class="hint">${esc(d.note || '')}</p>
   `, { wide: true }));
+
+  document.getElementById('mv-diff-run')?.addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    const target = document.getElementById('mv-compare-to')?.value;
+    const box = document.getElementById('mv-diff-result');
+    if (!target || !box) return;
+    btn.disabled = true;
+    btn.textContent = '比较中…';
+    try {
+      const out = await api(`/api/v2/methodology-versions/${encodeURIComponent(v.id)}/diff?compare_to=${encodeURIComponent(target)}`);
+      box.innerHTML = `<div class="version-diff">
+        ${out.insufficient_aspects?.length ? `<p class="callout callout-warn">无法比较：${esc(out.insufficient_aspects.join('、'))}。未用标题或相邻编号编造差异。</p>` : ''}
+        <div class="table-wrap"><table class="grid grid-sm"><thead><tr><th>维度</th><th>结论</th><th>差异摘要</th><th>来源定位</th></tr></thead><tbody>
+          ${(out.diffs || []).map((x) => `<tr>
+            <td>${esc(x.aspect_label || x.aspect)}</td>
+            <td>${x.change_kind === 'changed' ? chip('有差异', 'warn') : x.change_kind === 'same' ? chip('一致', 'ok') : chip('无法比较', 'muted')}</td>
+            <td>${esc(x.summary)}</td>
+            <td class="muted">${(x.evidence || []).map((ev) => `<div>${esc(ev.code_display || ev.version || '')}｜${esc(ev.locator)}<br><span class="muted">${esc(truncate(ev.quote, 90))}</span></div>`).join('') || '—'}</td>
+          </tr>`).join('')}
+        </tbody></table></div>
+        <p class="hint">${esc(out.note || '')}</p>
+      </div>`;
+    } catch (err) {
+      box.innerHTML = `<p class="callout callout-warn">${esc(err.body?.error || err.message)}</p>`;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '比较差异';
+    }
+  });
 }
 
 const SECTION_LABEL = {

@@ -18,6 +18,9 @@ import {
 } from '../ui.js';
 import { verifyChip } from './verify-labels.js';
 import { summaryBlock, summaryCoverageHint, sourceBlock } from '../platform.js';
+import {
+  fallbackFormOptions, loadFormOptions, selectOptionsHtml,
+} from '../form-selects.js';
 
 const TABS = [
   { key: 'public', label: '公开项目库' },
@@ -83,9 +86,13 @@ function ceaEntityEntry(cea) {
 /* ------------------------------ 公开项目库 ------------------------------ */
 
 async function renderPublicTab(body, q) {
-  const registryStatus = await api('/api/v2/registry/status');
   // CEA 名录覆盖数（失败不阻塞 CCER 项目库）：0 表示来源解析缺口，不添加假企业填充
-  const ceaEntities = await api('/api/v2/cea/entities?limit=1').catch((e) => ({ __error: e }));
+  // 表单选项来自公开数据聚合；读取失败时用本省行政区目录兜底，仍保留 URL 中的历史值。
+  const [registryStatus, ceaEntities, options] = await Promise.all([
+    api('/api/v2/registry/status'),
+    api('/api/v2/cea/entities?limit=1').catch((e) => ({ __error: e })),
+    loadFormOptions(api).catch(() => fallbackFormOptions()),
+  ]);
   const qs = new URLSearchParams(Object.fromEntries(Object.entries(q).filter(([k, v]) => v && k !== 'tab'))).toString();
   const data = await api(`/api/v2/public-projects${qs ? `?${qs}` : ''}`);
   const rows = data.rows || [];
@@ -94,16 +101,19 @@ async function renderPublicTab(body, q) {
   ${ceaEntityEntry(ceaEntities)}
   <div class="filters">
     <label class="fld"><span>关键词（名称/业主/登记编号/信用代码）</span><input type="search" data-f="keyword" value="${esc(q.keyword || '')}"></label>
-    <label class="fld"><span>省份</span><input type="search" data-f="province" value="${esc(q.province || '')}" placeholder="如 山西省"></label>
-    <label class="fld"><span>方法学编号</span><input type="search" data-f="methodology_id" value="${esc(q.methodology_id || '')}" placeholder="CCER-10-001"></label>
-    <label class="fld"><span>阶段</span><select data-f="stage"><option value="">全部</option>
-      ${[['project_public', '项目公示'], ['validated', '审定'], ['project_registered', '项目登记'], ['reduction_public', '减排量公示'], ['verified', '核查'], ['reduction_registered', '减排量登记']]
-        .map(([k, l]) => `<option value="${k}" ${q.stage === k ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
-    <label class="fld"><span>自动核验</span><select data-f="auto_verify_status"><option value="">全部</option>
-      ${VERIFY_OPTIONS.map(([k, l]) => `<option value="${k}" ${q.auto_verify_status === k ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
-    <label class="fld"><span>证据等级</span><select data-f="evidence_level"><option value="">全部</option>
-      ${[['official_registry', '官方登记/发布事实'], ['project_material', '业主公示或项目材料'], ['third_party', '第三方信息'], ['unverified', '待核实']]
-        .map(([k, l]) => `<option value="${k}" ${q.evidence_level === k ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
+    <label class="fld"><span>省份</span><select data-f="province">${selectOptionsHtml(options.projects.provinces, q.province, { allLabel: '全部省份' })}</select></label>
+    <label class="fld"><span>方法学编号</span><select data-f="methodology_id">${selectOptionsHtml(options.projects.methodologies, q.methodology_id, { allLabel: '全部方法学' })}</select></label>
+    <label class="fld"><span>阶段</span><select data-f="stage">${selectOptionsHtml(
+      [['project_public', '项目公示'], ['validated', '审定'], ['project_registered', '项目登记'], ['reduction_public', '减排量公示'], ['verified', '核查'], ['reduction_registered', '减排量登记']]
+        .map(([value, label]) => ({ value, label })), q.stage, { allLabel: '全部阶段' },
+    )}</select></label>
+    <label class="fld"><span>自动核验</span><select data-f="auto_verify_status">${selectOptionsHtml(
+      VERIFY_OPTIONS.map(([value, label]) => ({ value, label })), q.auto_verify_status, { allLabel: '全部核验状态' },
+    )}</select></label>
+    <label class="fld"><span>证据等级</span><select data-f="evidence_level">${selectOptionsHtml(
+      [['official_registry', '官方登记/发布事实'], ['project_material', '业主公示或项目材料'], ['third_party', '第三方信息'], ['unverified', '待核实']]
+        .map(([value, label]) => ({ value, label })), q.evidence_level, { allLabel: '全部证据等级' },
+    )}</select></label>
     <span class="fld-actions">
       <a class="btn btn-sm" href="/api/v2/public-projects/export?format=csv${qs ? `&${qs}` : ''}" download>导出 CSV</a>
       <a class="btn btn-sm" href="/api/v2/public-projects/export?format=xlsx${qs ? `&${qs}` : ''}" download>导出 Excel</a>

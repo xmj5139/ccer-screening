@@ -1,0 +1,14 @@
+# 公开信息智能化第二阶段可选依赖（docs/86）
+#
+# 仅 PDF 表格 worker 使用；不安装/调用重型模型。由 Codex 在隔离环境
+# 安装并锁定版本；DSH 本轮不安装、不联网。
+#
+# trafilatura 1.12.2 — Apache License 2.0
+#   https://github.com/adbar/trafilatura
+trafilatura==1.12.2
+#
+# pdfplumber 0.11.9 — MIT License（依赖 pdfminer.six / Pillow）
+#   https://github.com/jsvine/pdfplumber
+# Codex 已安装在 data/runtime/python-packages；若该目录没有，则使用
+# 本机 Python 环境中的同版本。未安装时后台如实返回 worker 不可用。
+pdfplumber==0.11.9

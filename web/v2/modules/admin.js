@@ -14,6 +14,10 @@ import {
 import { verifyChip } from './verify-labels.js';
 import { renderAccountingSourceTable, renderAccountingGaps, techDetails } from './accounting.js';
 import { renderMaintenance } from './maintenance.js';
+import { renderGovernance } from './governance.js';
+import {
+  fallbackFormOptions, loadFormOptions, selectOptionsHtml,
+} from '../form-selects.js';
 
 function safeHttpHref(value) {
   try {
@@ -24,12 +28,14 @@ function safeHttpHref(value) {
 
 const TABS = [
   { key: 'maintenance', label: '运行与内容维护' },
+  { key: 'governance', label: '信息治理与历史补采' },
   { key: 'status', label: '系统状态' },
   { key: 'datasources', label: '官方数据源' },
   { key: 'cea', label: 'CEA 配额市场' },
   { key: 'ocr', label: 'PDF 解析/OCR' },
   { key: 'accounting', label: '碳核算资料' },
   { key: 'connectors', label: '采集连接（搜索 API / 抓取 MCP）' },
+  { key: 'intelligence', label: '公开信息智能化' },
   { key: 'llm', label: '模型配置' },
   { key: 'deepseek', label: 'DeepSeek 能力' },
   { key: 'verify', label: '自动核验策略' },
@@ -46,14 +52,17 @@ export async function renderAdmin(root, route) {
     <div class="tabs">${TABS.map((t) => `<a class="tab ${t.key === tab ? 'active' : ''}" href="#/admin?tab=${t.key}">${esc(t.label)}</a>`).join('')}</div>
     <div id="tab-body">${loading()}</div>`;
   const body = document.getElementById('tab-body');
+  let cleanup = null;
   try {
-    if (tab === 'maintenance') await renderMaintenance(body);
+    if (tab === 'maintenance') await renderMaintenance(body, q);
+    else if (tab === 'governance') cleanup = await renderGovernance(body, q);
     else if (tab === 'status') await renderStatus(body);
     else if (tab === 'datasources') await renderDatasources(body);
-    else if (tab === 'cea') await renderCeaAdmin(body);
+    else if (tab === 'cea') await renderCeaAdmin(body, q);
     else if (tab === 'ocr') await renderOcrAdmin(body);
-    else if (tab === 'accounting') await renderAccountingAdmin(body);
+    else if (tab === 'accounting') await renderAccountingAdmin(body, q);
     else if (tab === 'connectors') await renderConnectors(body);
+    else if (tab === 'intelligence') await renderIntelligence(body, q);
     else if (tab === 'llm') await renderLlm(body);
     else if (tab === 'deepseek') await renderDeepSeek(body);
     else if (tab === 'verify') await renderVerify(body);
@@ -64,6 +73,7 @@ export async function renderAdmin(root, route) {
   } catch (e) {
     body.innerHTML = errorState(e);
   }
+  return cleanup;
 }
 
 /* ------------------------------ 采集连接 ------------------------------ */
@@ -1931,10 +1941,12 @@ function ceaJsonBlock(value) {
 }
 
 async function renderCeaAdmin(body) {
-  const [cfgOut, jobsOut, gapsOut] = await Promise.all([
+  const [cfgOut, jobsOut, gapsOut, formOptions, candidateOut] = await Promise.all([
     api('/api/v2/admin/cea/config'),
     api('/api/v2/admin/cea/jobs?limit=20'),
     api('/api/v2/admin/cea/document-gaps'),
+    loadFormOptions(api).catch(() => fallbackFormOptions()),
+    api('/api/v2/admin/market-candidates?limit=10').catch((e) => ({ __error: e, imports: [], rows: [] })),
   ]);
   const cfg = cfgOut.config || {};
   const defaults = cfgOut.defaults || {};
@@ -1943,6 +1955,8 @@ async function renderCeaAdmin(body) {
   const ai = sync.ai || {};
   const afterClose = cfgOut.after_close || null;
   const gaps = gapsOut.cea || [];
+  const adminProvinces = (formOptions.cea.provinces || []).filter((p) => p.value !== '全国');
+  const adminYears = formOptions.cea.years.entities.length ? formOptions.cea.years.entities : formOptions.cea.years.all;
 
   body.innerHTML = `
   <div class="grid-2">
@@ -2001,6 +2015,57 @@ async function renderCeaAdmin(body) {
   </div>
 
   ${card({
+    title: '第三方行情候选（独立表，不改官方行情）',
+    subtitle: 'CSV/JSON 候选导入 → missing/conflict/match/unsupported 差异报告；保留来源、截至日期与 stale 标志',
+    body: `
+      <form id="market-candidate-form" class="form-grid">
+        <label class="fld"><span>格式</span><select name="format"><option value="csv">CSV</option><option value="json">JSON</option></select></label>
+        <label class="fld"><span>来源名称（必填，或填来源链接）</span><input name="source_name" maxlength="120" placeholder="例如 china-ets-mcp 公开数据包"></label>
+        <label class="fld"><span>来源链接</span><input name="source_url" maxlength="500" placeholder="https://..."></label>
+        <label class="fld"><span>来源截至日期</span><input name="as_of" type="date"></label>
+        <label class="fld"><span>文件名（可选）</span><input name="file_name" maxlength="200"></label>
+        <label class="fld fld-inline"><span>标记 stale</span><input name="stale" type="checkbox"></label>
+        <label class="fld fld-wide"><span>CSV/JSON 内容（≤2MB、≤5000 行）</span><textarea name="text" rows="7" placeholder="trade_date,instrument,unit,volume,turnover,avg_price&#10;2026-03-05,CEA,tCO2e,1000,80000,80"></textarea></label>
+        <div class="quick-actions"><button class="btn btn-primary" type="submit">导入候选并生成差异</button>
+          <a class="btn btn-sm" href="/api/v2/admin/market-candidates/export?format=csv" download>导出当前候选 CSV</a></div>
+        <div id="market-candidate-msg">${candidateOut.__error ? errorState(candidateOut.__error) : '<p class="hint">导入只写候选表；不会修改 cea_trade_daily。</p>'}</div>
+      </form>
+      <h5>最近导入批次</h5>
+      ${(candidateOut.imports || []).length ? table({
+        rows: candidateOut.imports,
+        pageSize: 8,
+        columns: [
+          { key: 'source_name', label: '来源' },
+          { key: 'format', label: '格式' },
+          { key: 'as_of', label: '截至' },
+          { key: 'row_count', label: '行数', align: 'right' },
+          { key: 'stale', label: 'stale', render: (r) => (r.stale ? chip('stale', 'warn') : '—') },
+          { key: 'counts_json', label: '差异', render: (r) => esc(r.counts_json || '—') },
+          { key: 'created_at', label: '导入时间', render: (r) => esc(dateTime(r.created_at)) },
+          { key: 'actions', label: '导出', render: (r) => `<a class="link" href="/api/v2/admin/market-candidates/export?import_id=${encodeURIComponent(r.id)}&format=csv" download>CSV</a>` },
+        ],
+      }) : '<p class="muted">暂无候选批次。</p>'}
+      <h5>最近候选行（差异逐行保留）</h5>
+      ${(candidateOut.rows || []).length ? table({
+        rows: candidateOut.rows,
+        pageSize: 8,
+        columns: [
+          { key: 'trade_date', label: '日期' },
+          { key: 'instrument', label: '标的' },
+          { key: 'volume', label: '成交量', align: 'right' },
+          { key: 'turnover', label: '成交额', align: 'right' },
+          { key: 'avg_price', label: '均价', align: 'right' },
+          { key: 'unit', label: '来源单位' },
+          { key: 'diff_status', label: '差异', render: (r) => chip(r.diff_status, r.diff_status === 'match' ? 'ok' : r.diff_status === 'conflict' ? 'danger' : r.diff_status === 'missing' ? 'warn' : 'muted') },
+          { key: 'stale', label: 'stale', render: (r) => (r.stale ? chip('stale', 'warn') : '—') },
+          { key: 'notes', label: '说明', render: (r) => esc(truncate(r.notes || '—', 70)) },
+        ],
+      }) : '<p class="muted">暂无候选行。</p>'}
+    `,
+    note: '官方行情只读比对：候选 match 也不等于官方确认；不以均价补收盘价，不修改官方表。',
+  })}
+
+  ${card({
     title: '采集（点击后立即返回，不阻塞界面）',
     subtitle: '采集在服务端执行；返回 task/job_id、结果摘要与失败原因，本页其他操作不受影响',
     body: `
@@ -2010,8 +2075,8 @@ async function renderCeaAdmin(body) {
         </select></label>
         <label class="fld"><span>指定交易日（可选，逗号分隔）</span><input type="text" id="cea-dates" placeholder="2026-10-13,2026-10-14"></label>
         <label class="fld"><span>条数上限（可选）</span><input type="number" id="cea-limit" min="1" max="50" placeholder="留空用服务端默认"></label>
-        <label class="fld"><span>名录年度（entities 可选）</span><input type="number" id="cea-list-year" min="2000" max="2100" placeholder="如 2026"></label>
-        <label class="fld"><span>省份（entities 可选）</span><input type="search" id="cea-province" placeholder="如 福建省"></label>
+        <label class="fld"><span>名录年度（entities 可选）</span><input id="cea-list-year" type="number" min="2000" max="2100" list="cea-collect-year-options" placeholder="选择或输入新年度；留空不限定">${datalistHtml('cea-collect-year-options', adminYears)}</label>
+        <label class="fld"><span>省份（entities 可选）</span><select id="cea-province">${selectOptionsHtml(adminProvinces, '', { allLabel: '全部省份' })}</select></label>
         <span class="fld-actions"><button class="btn btn-primary" id="cea-collect-btn">执行采集</button></span>
       </div>
       <p class="hint" id="cea-target-hint">${esc(CEA_TARGETS[0].hint)}</p>
@@ -2347,6 +2412,39 @@ async function renderCeaAdmin(body) {
     } finally {
       btn.disabled = false;
       btn.textContent = '核验待核验文件（documents）';
+    }
+  });
+
+  /* ---------------- 第三方行情候选 ---------------- */
+  body.querySelector('#market-candidate-form')?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const form = e.currentTarget;
+    const msg = body.querySelector('#market-candidate-msg');
+    const f = new FormData(form);
+    const payload = {
+      format: f.get('format') || 'csv',
+      text: f.get('text') || '',
+      source_name: f.get('source_name') || null,
+      source_url: f.get('source_url') || null,
+      as_of: f.get('as_of') || null,
+      file_name: f.get('file_name') || null,
+      stale: f.get('stale') === 'on',
+    };
+    if (!String(payload.text).trim()) { msg.innerHTML = errorState({ status: 400, body: { error: '请粘贴 CSV/JSON 内容' } }); return; }
+    msg.innerHTML = loading('正在校验并生成差异报告…（不修改官方行情）');
+    try {
+      const out = await api('/api/v2/admin/market-candidates/import', { method: 'POST', body: payload });
+      const c = out.counts || {};
+      msg.innerHTML = `<div class="callout ${c.conflict ? 'callout-warn' : 'callout-ok'}">
+        <b>导入完成：${num(out.row_count)} 行</b>
+        <p>match ${num(c.match)}｜conflict ${num(c.conflict)}｜missing ${num(c.missing)}｜unsupported ${num(c.unsupported)}｜stale ${num(c.stale)}</p>
+        <p class="hint">${esc(out.note || '')}</p>
+        <a class="link" href="/api/v2/admin/market-candidates/export?import_id=${encodeURIComponent(out.import_id)}&format=csv" download>下载本次差异 CSV</a>
+      </div>`;
+      toast('候选已导入，官方行情未修改', c.conflict ? 'warn' : 'ok');
+    } catch (err) {
+      msg.innerHTML = errorState(err);
+      toast(err.body?.error || err.message, 'danger');
     }
   });
 }
@@ -2862,7 +2960,7 @@ function startAccountingPoll(box, taskId) {
   accountingPollTimer = setInterval(tick, 2500);
 }
 
-async function renderAccountingAdmin(body) {
+async function renderAccountingAdmin(body, q = {}) {
   // 切页签/重渲染：先清掉上一轮轮询，避免定时器在已卸载的节点上继续跑
   stopAccountingPoll();
 
@@ -3030,6 +3128,17 @@ async function renderAccountingAdmin(body) {
           PDF 无可用文本层时保留原件但<b>不</b>写入空正文，也不标记「已取得全文」。</p>`, '高级设置：按服务器受限目录解析（默认无需使用）')}`,
     })}
   </div>`;
+
+  // 从治理详情跳转：预选标准实体，仍使用本页现有 PDF 上传/解析入口。
+  if (q.upload_type === 'accounting_standard' && q.upload_id) {
+    const idEl = body.querySelector('#acc-upload-id');
+    if (idEl) {
+      idEl.value = q.upload_id;
+      idEl.scrollIntoView({ block: 'center' });
+      const fileEl = body.querySelector('#acc-upload-file');
+      if (fileEl) fileEl.focus();
+    }
+  }
 
   /* ---------------- 配置保存 ---------------- */
   const cfgForm = body.querySelector('#acc-cfg-form');
@@ -3233,3 +3342,298 @@ async function renderAccountingAdmin(body) {
     }
   });
 }
+
+/* ------------------------------ 公开信息智能化（docs/86） ------------------------------ */
+
+function bindPdfJobButtons(body) {
+  body.querySelectorAll('[data-pdf-job]').forEach((el) => {
+    if (el.dataset.pdfJobBound === '1') return;
+    el.dataset.pdfJobBound = '1';
+    el.addEventListener('click', async () => {
+      el.disabled = true;
+      try {
+        const d = await api(`/api/v2/admin/pdf-tables/jobs/${el.dataset.pdfJob}?limit=200`);
+        const job = d.job || {};
+        const pages = (d.pages || []).map((p) => `<tr>
+          <td>${num(p.page)}</td><td>${p.has_text_layer ? '有' : '无'}</td>
+          <td>${num(p.table_count)}</td><td>${num(p.row_count)}</td>
+          <td>${esc(p.status)}${p.error ? `<div class="muted">${esc(p.error)}</div>` : ''}</td>
+        </tr>`).join('');
+        const tableBlocks = (d.tables || []).slice(0, 5).map((t) => `<details>
+          <summary>第 ${num(t.page)} 页 · 表 ${num(t.table_index)} · ${num(t.rows)} 行 × ${num(t.cols)} 列</summary>
+          <pre class="body-snapshot">${esc((t.data || []).map((r) => (r || []).join(' | ')).join('\n'))}</pre>
+          <p class="hint">单元格行列均为 0 起；共 ${num((t.cells || []).length)} 个非空单元格。</p>
+        </details>`).join('');
+        document.body.insertAdjacentHTML('beforeend', drawer(`PDF 表格任务 ${truncate(job.file_name || job.id, 30)}`, `
+          <div class="drawer-section">
+            <p><b>状态：${esc(job.status)}</b>｜页 ${num(job.pages_processed)}/${num(job.pages_total)}｜页处理率 ${esc(job.coverage_label || '')}｜
+            表格 ${num(job.table_count)}｜行 ${num(job.row_count)}｜失败页 ${num(job.pages_failed)}</p>
+            ${job.partial_reason ? `<p class="hint">partial/失败原因：${esc(job.partial_reason)}；扫描空页不等于零家企业。</p>` : ''}
+            ${job.error ? `<div class="callout callout-warn">${esc(job.error)}</div>` : ''}
+            <h4>逐页结果</h4>
+            <div class="table-wrap"><table class="grid compact">
+              <thead><tr><th>页码</th><th>文本层</th><th>表格</th><th>行</th><th>状态</th></tr></thead>
+              <tbody>${pages || '<tr><td colspan="5" class="muted">无页记录</td></tr>'}</tbody>
+            </table></div>
+            <h4>表格预览（最多 5 张）</h4>
+            ${tableBlocks || '<p class="muted">没有提取到表格；这不等于“零家企业”。</p>'}
+            <p class="hint">${esc(d.note || '')}</p>
+          </div>`, { wide: true }));
+        document.querySelectorAll('[data-close-drawer]').forEach((x) => x.addEventListener('click', () => {
+          document.querySelector('.drawer-backdrop')?.remove();
+          document.querySelector('.drawer')?.remove();
+        }));
+      } catch (err) {
+        toast(err.body?.error || err.message, 'error');
+      } finally {
+        el.disabled = false;
+      }
+    });
+  });
+}
+
+async function renderIntelligence(body, q = {}) {
+  const [d, idx, pdf] = await Promise.all([
+    api('/api/v2/admin/rss-sources?limit=100'),
+    api('/api/v2/admin/search-index').catch((e) => ({ __error: e })),
+    api('/api/v2/admin/pdf-tables?limit=20').catch((e) => ({ __error: e })),
+  ]);
+  const sources = d.sources || [];
+  const candidates = d.candidates || [];
+  const limits = d.limits || {};
+  const idxStatus = idx.status || {};
+  const pdfWorker = pdf.worker || {};
+  const pdfJobs = pdf.jobs || [];
+  const pdfCandidates = pdf.__error ? [] : (await api('/api/v2/admin/pdf-tables/candidates?limit=100').catch(() => ({ candidates: [] }))).candidates || [];
+  body.innerHTML = `
+    <div class="callout callout-info">
+      <b>第一阶段：正文清洗 · 实质变化与版本 · 字段引句证据 · RSS 候选发现</b>
+      <p class="hint">RSS/Atom 只提供候选标题、链接、日期和订阅摘要；订阅摘要不是全文，正文仍走既有抓取/清洗/摘要流程。
+      地址保存前拒绝内网、本机、字面 IP 与带凭据 URL；解析器拒绝 DOCTYPE/ENTITY，禁止外部实体。</p>
+      <p class="hint">每日任务默认最多 ${esc(limits.max_sources_per_run || 5)} 个来源、每源 ${esc(limits.max_items_per_source || 20)} 条、
+      正文抓取 ${esc(limits.max_fetch_bodies || 3)} 条、总预算 ${Math.round(Number(limits.budget_ms || 60000) / 1000)} 秒。</p>
+    </div>
+
+    ${card({
+      title: '中文全文索引（FTS5）',
+      subtitle: idx.__error
+        ? '索引状态不可用'
+        : `${idxStatus.ready ? '可用' : '未就绪'}｜文档 ${num(idxStatus.doc_count)}｜索引 ${num(idxStatus.fts_count)}｜待刷新 ${num(idxStatus.dirty_count)}｜版本 ${esc(idxStatus.version || '—')}`,
+      body: idx.__error
+        ? errorState(idx.__error)
+        : `<p>${esc(idxStatus.note || '')}</p>
+          <p class="form-static">最近构建：${esc(idxStatus.last_build_at ? dateTime(idxStatus.last_build_at) : '—')}
+          ｜最近完整构建：${esc(idxStatus.last_full_build_at ? dateTime(idxStatus.last_full_build_at) : '—')}
+          ｜状态：${esc(idxStatus.last_full_status || '未构建')}</p>
+          <form id="fts-rebuild-form" class="form-grid">
+            <label class="fld"><span>本批最多处理（每种类型）</span>
+              <input name="max_docs" type="number" min="1" max="${esc(String(idx.limits?.max_batch || 20000))}" value="2000"></label>
+            <div class="fld"><button class="btn btn-primary" type="submit">重建/增量刷新索引</button></div>
+          </form>
+          <p class="hint">查询不会触发全库重建；后台按有限批次构建。未完整构建时统一检索如实回退既有检索并显示 mode=legacy_fallback。
+          中文双字、英文编号（含 CCER-10-001）、真实总数分页均由索引提供。</p>`,
+      note: '普通用户不能写索引；索引只覆盖公开实体，不包含用户、凭据、审计或配置。',
+    })}
+
+    ${card({
+      title: 'PDF 表格解析（pdfplumber 独立 worker）',
+      subtitle: pdf.__error
+        ? 'worker 状态不可用'
+        : `${esc(pdfWorker.parser || 'pdfplumber')}｜${pdfWorker.availability === 'not_probed' ? '可用性尚未探测' : pdfWorker.available ? '最近真实任务可用' : '最近真实任务不可用'}｜任务 ${num(pdfWorker.counts?.total)}｜完成 ${num(pdfWorker.counts?.done)}｜部分 ${num(pdfWorker.counts?.partial)}｜失败 ${num(pdfWorker.counts?.failed)}`,
+      body: pdf.__error ? errorState(pdf.__error) : `
+        <p class="hint">${esc(pdfWorker.note || '')}</p>
+        <form id="pdf-run-form" class="form-grid">
+          <label class="fld fld-wide"><span>受限原件（已归档）</span><select name="target">
+            <option value="">— 选择已归档原件 —</option>
+            ${pdfCandidates.map((c) => `<option value="${esc(c.kind)}|${esc(c.id)}">${esc(c.kind)}｜${esc(truncate(c.title || c.file_name, 52))}（${esc(c.size_label || '')}）</option>`).join('')}
+          </select><small>只列受限根内真实存在的 PDF；管理员上传/OCR 治理归档的原件也可选。</small></label>
+          <label class="fld fld-wide"><span>或受限根内路径（可选，用于验收样本）</span><input name="path" placeholder="data/backups/.../samples/hunan-steel-2026.pdf"></label>
+          <label class="fld"><span>最多页数</span><input name="max_pages" type="number" min="1" max="${esc(String(pdfWorker.limits?.max_pages || 500))}" value="20"></label>
+          <div class="fld"><button class="btn btn-primary" type="submit">执行表格解析</button></div>
+        </form>
+        <p class="hint">单并发；文件 ≤ ${Math.round(Number(pdfWorker.limits?.max_bytes || 0) / 1024 / 1024)} MB、页数 ≤ ${esc(String(pdfWorker.limits?.max_pages || 500))}、
+        超时 ${Math.round(Number(pdfWorker.limits?.timeout_ms || 0) / 1000)} 秒。只接受受限根内 .pdf，拒绝 ../ 与符号链接越界。
+        扫描/空白页只记为“无文本层/表格”，不会推断零家企业。</p>
+        <div id="pdf-run-out"></div>
+        ${pdfJobs.length ? table({
+          pageSize: 10,
+          emptyText: '尚无 PDF 表格任务',
+          columns: [
+            { key: 'file_name', label: '文件', render: (r) => `<b>${esc(truncate(r.file_name || r.file_path, 48))}</b><div class="muted">${esc(r.file_hash?.slice(0, 12) || '')}</div>` },
+            { key: 'status', label: '状态', render: (r) => chip(r.status, r.status === 'done' ? 'ok' : r.status === 'partial' ? 'warn' : r.status === 'failed' ? 'danger' : '') },
+            { key: 'pages', label: '页处理率', render: (r) => `${num(r.pages_processed)}/${num(r.pages_total)}｜${esc(r.coverage_label || '')}` },
+            { key: 'tables', label: '表格/行', render: (r) => `${num(r.table_count)} 表 / ${num(r.row_count)} 行` },
+            { key: 'partial_reason', label: '说明', render: (r) => esc(r.partial_reason || r.error || '—') },
+            { key: 'actions', label: '详情', render: (r) => `<button class="btn btn-xs" data-pdf-job="${esc(r.id)}">查看页码/行列</button>` },
+          ],
+          rows: pdfJobs,
+        }) : '<p class="muted">尚无 PDF 表格任务；成功/失败都会如实记录页码、覆盖率和原因。</p>'}
+        <p class="hint">结果包含物理页码（1 起）、表序号、行列与单元格文本；partial 表示页数上限/失败页/无文本层，不是“全文完成”。</p>`,
+      note: '普通用户不能触发解析写动作；worker 不安装/调用重型模型，失败保留原件与既有正文。',
+    })}
+
+    ${card({
+      title: 'RSS / Atom 来源',
+      subtitle: `已配置 ${sources.length} 个来源；启用后进入每日有界发现，不启动常驻采集 worker`,
+      body: `
+        <form id="rss-source-form" class="form-grid">
+          <label class="fld"><span>名称</span><input name="name" required maxlength="200" placeholder="例如 生态环境部新闻"></label>
+          <label class="fld"><span>RSS / Atom 地址</span><input name="url" required type="url" placeholder="https://example.gov.cn/rss.xml"></label>
+          <label class="fld"><input name="enabled" type="checkbox" checked> 启用</label>
+          <div class="fld"><button class="btn btn-primary" type="submit">保存来源</button></div>
+        </form>
+        ${table({
+          pageSize: 20,
+          emptyText: '尚未配置 RSS 来源',
+          emptyDetail: '添加公开 RSS/Atom 地址后，可在每日任务或本页手动执行有界发现。',
+          columns: [
+            { key: 'name', label: '名称', render: (r) => `<b>${esc(r.name)}</b><div class="muted">${esc(truncate(r.url, 60))}</div>` },
+            { key: 'enabled', label: '状态', render: (r) => (r.enabled ? chip('已启用', 'ok') : chip('已停用', '')) },
+            { key: 'status', label: '最近结果', render: (r) => chip(r.status || 'never', r.status === 'ok' ? 'ok' : r.status === 'failed' ? 'danger' : 'warn') },
+            { key: 'last_success_at', label: '最近成功', render: (r) => esc(r.last_success_at ? dateTime(r.last_success_at) : '—') },
+            { key: 'items', label: '累计', align: 'right', render: (r) => `${num(r.items_seen)} 条 / 新增 ${num(r.items_new)}` },
+            { key: 'last_error', label: '最近失败', render: (r) => (r.last_error ? `<span class="muted" title="${esc(r.last_error)}">${esc(truncate(r.last_error, 42))}</span>` : '—') },
+            { key: 'actions', label: '操作', render: (r) => `<button class="btn btn-xs" data-rss-test="${esc(r.id)}">真实解析测试</button>
+              <button class="btn btn-xs" data-rss-discover="${esc(r.id)}">有界发现</button>
+              <button class="btn btn-xs" data-rss-toggle="${esc(r.id)}" data-on="${r.enabled ? '0' : '1'}">${r.enabled ? '停用' : '启用'}</button>` },
+          ],
+          rows: sources,
+        })}
+        <p class="hint">「真实解析测试」会请求该地址一次并显示真实条目数；「有界发现」只处理有限条目，默认不抓正文。</p>`,
+      note: 'RSS 来源地址与条目链接都会做内网/协议校验；失败如实显示，不用空结果假装成功。',
+    })}
+
+    ${card({
+      title: 'RSS 候选',
+      subtitle: `最近 ${candidates.length} 条候选；订阅摘要不作为全文`,
+      body: table({
+        pageSize: 25,
+        emptyText: '尚无 RSS 候选',
+        columns: [
+          { key: 'published_at', label: '发布日', render: (r) => esc(r.published_at || '未披露') },
+          { key: 'title', label: '标题', render: (r) => `${esc(truncate(r.title || '(无标题)', 64))}<div class="muted">${esc(truncate(r.url, 72))}</div>` },
+          { key: 'status', label: '状态', render: (r) => chip(r.status, r.status === 'inserted' ? 'ok' : r.status === 'failed' ? 'danger' : '') },
+          { key: 'content_item_id', label: '入库条目', render: (r) => (r.content_item_id ? `<code>${esc(r.content_item_id)}</code>` : '—') },
+          { key: 'discovered_at', label: '发现时间', render: (r) => esc(dateTime(r.discovered_at)) },
+        ],
+        rows: candidates,
+      }),
+      note: '候选按 URL 幂等；同一 URL 重复出现不会重复入库。摘要只来自订阅源，不声称已读全文。',
+    })}
+  `;
+
+  body.querySelector('#fts-rebuild-form')?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.currentTarget);
+    const maxDocs = Math.max(1, Number(fd.get('max_docs')) || 2000);
+    const btn = e.currentTarget.querySelector('button[type="submit"]');
+    if (btn) { btn.disabled = true; btn.textContent = '构建中…'; }
+    try {
+      const out = await api('/api/v2/admin/search-index/rebuild', {
+        method: 'POST', body: { max_docs: maxDocs },
+      });
+      toast(`索引批次：处理 ${out.indexed || 0}，新增 ${out.inserted || 0}，更新 ${out.updated || 0}，跳过 ${out.skipped || 0}`, out.truncated ? 'warn' : 'ok');
+      await renderIntelligence(body, q);
+    } catch (err) {
+      toast(err.body?.error || err.message, 'error');
+      if (btn) { btn.disabled = false; btn.textContent = '重建/增量刷新索引'; }
+    }
+  });
+
+  body.querySelector('#pdf-run-form')?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.currentTarget);
+    const target = String(fd.get('target') || '');
+    const path = String(fd.get('path') || '').trim();
+    const payload = {
+      max_pages: Math.max(1, Number(fd.get('max_pages')) || 20),
+    };
+    if (path) payload.path = path;
+    else if (target.includes('|')) {
+      const [kind, id] = target.split('|');
+      payload.target_kind = kind;
+      payload.target_id = id;
+    } else {
+      toast('请选择受限原件或填写受限根内路径', 'warn');
+      return;
+    }
+    const outBox = body.querySelector('#pdf-run-out');
+    const btn = e.currentTarget.querySelector('button[type="submit"]');
+    if (btn) { btn.disabled = true; btn.textContent = '解析中…'; }
+    if (outBox) outBox.innerHTML = loading('正在启动独立 pdfplumber worker；只读取受限原件，不联网、不调用模型…');
+    try {
+      const out = await api('/api/v2/admin/pdf-tables/run', { method: 'POST', body: payload });
+      const job = out.job || out.body?.job;
+      if (outBox) {
+        outBox.innerHTML = `<div class="callout ${job?.status === 'done' ? 'callout-info' : 'callout-warn'}">
+          <b>任务 ${esc(job?.id || '')}：${esc(job?.status || 'unknown')}</b>
+          <p>页 ${num(job?.pages_processed)}/${num(job?.pages_total)}｜页处理率 ${esc(job?.coverage_label || '')}｜表格 ${num(job?.table_count)}｜行 ${num(job?.row_count)}｜失败页 ${num(job?.pages_failed)}</p>
+          <p>${esc(out.note || job?.error || '')}</p>
+          ${job?.partial_reason ? `<p class="hint">partial/失败原因：${esc(job.partial_reason)}。扫描空页不等于零家企业。</p>` : ''}
+          ${job?.id ? `<button class="btn btn-sm" data-pdf-job="${esc(job.id)}">查看页码/行列</button>` : ''}
+        </div>`;
+      }
+      toast(out.ok ? `PDF 表格任务：${job?.status || '完成'}` : (out.error || job?.error || '解析失败'), out.ok ? 'ok' : 'warn');
+      bindPdfJobButtons(body);
+    } catch (err) {
+      const msg = err.body?.error || err.body?.job?.error || err.message;
+      if (outBox) outBox.innerHTML = errorState(err);
+      toast(msg, 'error');
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = '执行表格解析'; }
+    }
+  });
+
+  bindPdfJobButtons(body);
+
+  body.querySelector('#rss-source-form')?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.currentTarget);
+    const payload = { name: fd.get('name'), url: fd.get('url'), enabled: fd.get('enabled') === 'on' };
+    try {
+      await api('/api/v2/admin/rss-sources', { method: 'POST', body: payload });
+      toast('RSS 来源已保存', 'ok');
+      await renderIntelligence(body, q);
+    } catch (err) {
+      toast(err.body?.error || err.message, 'error');
+    }
+  });
+  body.querySelectorAll('[data-rss-test]').forEach((el) => el.addEventListener('click', async () => {
+    el.disabled = true; el.textContent = '解析中…';
+    try {
+      const out = await api(`/api/v2/admin/rss-sources/${el.dataset.rssTest}/test`, { method: 'POST', body: {} });
+      toast(out.ok ? `解析成功：${out.items} 条（${out.format}）` : `解析失败：${out.message || out.reason}`, out.ok ? 'ok' : 'warn');
+      await renderIntelligence(body, q);
+    } catch (err) {
+      toast(err.body?.error || err.message, 'error');
+      el.disabled = false; el.textContent = '真实解析测试';
+    }
+  }));
+  body.querySelectorAll('[data-rss-discover]').forEach((el) => el.addEventListener('click', async () => {
+    el.disabled = true; el.textContent = '发现中…';
+    try {
+      const out = await api(`/api/v2/admin/rss-sources/${el.dataset.rssDiscover}/discover`, {
+        method: 'POST', body: { max_items: 20, fetch_bodies: false, budget_ms: 60000 },
+      });
+      toast(out.ok ? `有界发现完成：候选 ${out.items}，新增 ${out.inserted}` : `发现失败：${out.message || out.reason}`, out.ok ? 'ok' : 'warn');
+      await renderIntelligence(body, q);
+    } catch (err) {
+      toast(err.body?.error || err.message, 'error');
+      el.disabled = false; el.textContent = '有界发现';
+    }
+  }));
+  body.querySelectorAll('[data-rss-toggle]').forEach((el) => el.addEventListener('click', async () => {
+    el.disabled = true;
+    try {
+      await api(`/api/v2/admin/rss-sources/${el.dataset.rssToggle}/pause`, {
+        method: 'POST', body: { enabled: el.dataset.on === '1' },
+      });
+      toast(el.dataset.on === '1' ? 'RSS 来源已启用' : 'RSS 来源已停用', 'ok');
+      await renderIntelligence(body, q);
+    } catch (err) {
+      toast(err.body?.error || err.message, 'error');
+      el.disabled = false;
+    }
+  }));
+}
+

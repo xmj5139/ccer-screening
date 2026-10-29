@@ -864,6 +864,35 @@ export async function runSummaryBatch({
   return out;
 }
 
+/**
+ * 带全局单并发锁的有界摘要批次（治理 worker / 每日尾批共用）。
+ * 已有批次在跑时返回 {busy:true, reason:'already_running'}，不排队、不并发打模型。
+ */
+export async function runSummaryBatchExclusive(options = {}) {
+  if (!acquireBatchLock()) {
+    const running = runningSummaryTask();
+    return {
+      busy: true, reason: 'already_running', scanned: 0, generated: 0, failed: 0,
+      skipped: 0, model_configured: null, task_id: running?.id || null,
+    };
+  }
+  const lease = acquireSummaryModelLease({ budgetMs: options.budgetMs || DEFAULT_BATCH_BUDGET_MS });
+  if (!lease.ok) {
+    releaseBatchLock();
+    return {
+      busy: true, reason: lease.reason || 'summary_lease_busy', scanned: 0, generated: 0,
+      failed: 0, skipped: 0, model_configured: null, task_id: null,
+      lease: lease.lease || null,
+    };
+  }
+  try {
+    return await runSummaryBatch(options);
+  } finally {
+    releaseSummaryModelLease({ owner: lease.owner });
+    releaseBatchLock();
+  }
+}
+
 /* ==================================================================== */
 /*  三之二、后台异步任务（202 + 轮询；全局单并发）                        */
 /* ==================================================================== */
@@ -908,6 +937,48 @@ function acquireBatchLock() {
 
 function releaseBatchLock() {
   batchLock = false;
+}
+
+/**
+ * 跨进程模型批次租约。进程内 batchLock 只能防同一进程；worker、后台任务与
+ * 每日链路可能来自不同进程，因此再用既有 governance_lease 表做一层短租约。
+ * 锁顺序固定：调用方（如入库 worker）先取自己的租约，再进入这里；
+ * 本函数不会反向获取任何采集/worker 租约。
+ */
+let summaryLeaseSeq = 0;
+
+export function acquireSummaryModelLease({ owner = null, budgetMs = DEFAULT_BATCH_BUDGET_MS } = {}) {
+  const leaseOwner = owner || `summary:${process.pid}:${Date.now()}:${summaryLeaseSeq += 1}`;
+  const ttl = Math.max(120_000, Math.min(clampBatchBudget(budgetMs) + 60_000, 360_000));
+  const now = nowIso();
+  const expires = new Date(Date.now() + ttl).toISOString();
+  try {
+    const out = run(
+      `INSERT INTO governance_lease (lease_key,owner,purpose,acquired_at,heartbeat_at,expires_at)
+       VALUES ('summary_model',?,?,?,?,?)
+       ON CONFLICT(lease_key) DO UPDATE SET owner=excluded.owner,purpose=excluded.purpose,
+         acquired_at=excluded.acquired_at,heartbeat_at=excluded.heartbeat_at,expires_at=excluded.expires_at
+       WHERE governance_lease.expires_at <= ?`,
+      [leaseOwner, 'summary_batch', now, now, expires, now]
+    );
+    if (!out || Number(out.changes || 0) < 1) {
+      return { ok: false, reason: 'summary_lease_busy', lease: get("SELECT * FROM governance_lease WHERE lease_key='summary_model'") };
+    }
+    return { ok: true, owner: leaseOwner, expires_at: expires };
+  } catch {
+    // 表未就绪（非 v2 独立模块调用）时不阻断既有摘要路径；v2 服务始终有该表。
+    return { ok: true, owner: leaseOwner, expires_at: null, table_missing: true };
+  }
+}
+
+export function releaseSummaryModelLease({ owner }) {
+  if (!owner) return { ok: false };
+  try {
+    const out = run("DELETE FROM governance_lease WHERE lease_key='summary_model' AND owner=?", [owner]);
+    return { ok: true, released: Number(out?.changes || 0) > 0 };
+  } catch {
+    return { ok: false };
+  }
 }
 
 /** 是否已有摘要批次在执行（任务行或进程内锁任一成立）。 */
@@ -974,6 +1045,13 @@ export async function runSummaryTask(taskId, { actor = 'system:summary', budgetM
       ['已有摘要批次在执行中（全局单并发），本次未执行，可稍后重新发起', nowIso(), nowIso(), taskId]);
     return { ok: false, busy: true, error: '已有摘要批次在执行中（全局单并发）', status: 409 };
   }
+  const lease = acquireSummaryModelLease({ budgetMs });
+  if (!lease.ok) {
+    releaseBatchLock();
+    run("UPDATE summary_task SET status='failed', error=?, finished_at=?, heartbeat_at=? WHERE id=?",
+      ['其他进程正在执行摘要批次（summary_model 租约占用），本次未执行，可稍后重新发起', nowIso(), nowIso(), taskId]);
+    return { ok: false, busy: true, error: '其他进程正在执行摘要批次', status: 409 };
+  }
   const startedAt = nowIso();
   run("UPDATE summary_task SET status='running', started_at=?, heartbeat_at=? WHERE id=?", [startedAt, startedAt, taskId]);
   let parsedIds = null;
@@ -993,6 +1071,7 @@ export async function runSummaryTask(taskId, { actor = 'system:summary', budgetM
       [String(e?.message || e).slice(0, 500), nowIso(), nowIso(), taskId]);
     return { ok: false, error: e?.message || String(e) };
   } finally {
+    releaseSummaryModelLease({ owner: lease.owner });
     releaseBatchLock();
   }
   const status = !out.model_configured
@@ -1014,25 +1093,16 @@ export async function runSummaryTask(taskId, { actor = 'system:summary', budgetM
  * docs/46 第 11 条：与后台任务共用同一把「全局单并发」锁，避免重叠打满小服务器。
  */
 export async function refreshAfterDaily({ limit = 6, budgetMs = 60_000, actor = 'system:daily' } = {}) {
-  const busy = summaryBatchBusy();
-  if (busy) {
-    const running = runningSummaryTask();
+  const picked = await runSummaryBatchExclusive({
+    limit, budgetMs: clampBatchBudget(budgetMs), actor, perEntityLimit: 2, entityType: null,
+  });
+  if (picked?.busy) {
     return {
-      ok: false, skipped: true, reason: 'already_running', task_id: running?.id || null,
-      message: '已有摘要批次在执行中（全局单并发），本次日更新跳过摘要刷新。',
+      ok: false, skipped: true, reason: picked.reason || 'already_running', task_id: picked.task_id || null,
+      message: '已有摘要批次在执行中（全局/跨进程单并发），本次日更新跳过摘要刷新。',
     };
   }
-  if (!acquireBatchLock()) {
-    return { ok: false, skipped: true, reason: 'already_running', task_id: null, message: '已有摘要批次在执行中（全局单并发），本次日更新跳过摘要刷新。' };
-  }
-  try {
-    const picked = await runSummaryBatch({
-      limit, budgetMs: clampBatchBudget(budgetMs), actor, perEntityLimit: 2, entityType: null,
-    });
-    return { ok: true, ...picked };
-  } catch (e) {
-    return { ok: false, error: String(e?.message || e) };
-  }
+  return { ok: true, ...picked };
 }
 
 /* ==================================================================== */

@@ -2,10 +2,44 @@ import {createHash} from 'node:crypto';
 import {get} from '../core/db.mjs';
 import {callVerifyModel,pickVerifyProvider,validateCitations,recordVerification} from './verification-svc.mjs';
 export const digest=(text)=>createHash('sha256').update(String(text)).digest('hex');
+export const ACCOUNTING_EVIDENCE_POLICY='accounting-evidence-v4';
+
+/** 与模型核验共用的当前输入签名（正文/著录/URL/完整性/策略）。 */
+export function accountingEvidenceHash({body,metadata,url,complete}){
+ return digest(JSON.stringify({body,metadata,url,complete,policy:ACCOUNTING_EVIDENCE_POLICY}));
+}
+
+/**
+ * 阶段治理读取真实表中的正文/著录并计算当前签名。
+ * 字段顺序必须与 verifyStandardWithModel / verifyPublicDocument 完全一致；
+ * 只支持这两类碳核算公开对象，不接受调用方传表名。
+ */
+export function accountingEvidenceFingerprint(objectType,row){
+ if(!row)return null;
+ if(objectType==='accounting_standard'){
+  const input={
+   body:row.body_text,
+   metadata:{code:row.code,title:row.title,sector:row.sector,version:row.version},
+   url:row.original_url,
+   complete:row.body_status==='full'&&!!row.extraction_complete,
+  };
+  return{input,input_hash:accountingEvidenceHash(input)};
+ }
+ if(objectType==='accounting_public_document'){
+  const input={
+   body:row.body_text,
+   metadata:{title:row.title,source:row.issuer,published_at:row.published_at,category:row.category},
+   url:row.url,
+   complete:row.body_status==='full',
+  };
+  return{input,input_hash:accountingEvidenceHash(input)};
+ }
+ return null;
+}
 
 /** A model verdict concerns fidelity to supplied evidence, never legal currency or permission. */
 export async function verifyAccountingEvidence({objectType,objectId,body,metadata,url,complete,actor='system:accounting',deadlineAt=null,force=false}){
- const provider=pickVerifyProvider();const evidence=String(body||'').slice(0,24000);const hash=digest(JSON.stringify({body,metadata,url,complete,policy:'accounting-evidence-v4'}));
+ const provider=pickVerifyProvider();const evidence=String(body||'').slice(0,24000);const hash=accountingEvidenceHash({body,metadata,url,complete});
  if(!evidence.trim()||!provider)return{result:'unavailable',reason:!evidence.trim()?'no_body':'no_provider',note:!evidence.trim()?'未取得正文，不做模型核验':'未配置可用模型',input_hash:hash};
  const cached=get("SELECT * FROM verification_result WHERE object_type=? AND object_id=? AND input_hash=? AND provider_id=? AND model=? AND result='verified' ORDER BY created_at DESC LIMIT 1",[objectType,objectId,hash,provider.id,provider.model]);
  if(cached&&!force)return{result:'verified',cached:true,input_hash:hash,citations_validated:cached.citations_validated,citations_rejected:0};

@@ -22,6 +22,16 @@ import { pickFetchConnection } from './web-fetch-svc.mjs';
 import { runSearchWithFallback, fetchWithFallback } from './deepseek-fallback-svc.mjs';
 import { verifyContentItem, verifyConfig, ensureBuiltinRules } from './verification-svc.mjs';
 import { parseCetsArticlePage } from './accounting-parse.mjs';
+import { syncContentStages, invalidateContentConclusions } from './processing-stage-svc.mjs';
+import { enqueueContentSummary } from './ingest-summary-svc.mjs';
+import {
+  cleanContent, htmlToText, cleanText, bodyFingerprints, attachmentFingerprint,
+  extractAttachmentLinks, diffSummary, sha256Text, CLEANER_VERSION, classifyPage,
+} from './content-clean-svc.mjs';
+import {
+  extractDeterministicFields, markFieldsStale, getFieldEvidence,
+} from './field-evidence-svc.mjs';
+import { refreshSearchEntity, removeSearchEntity } from './search-index-svc.mjs';
 
 /* ==================================================================== */
 /*  一、来源与关键词种子（官网可用性逐一验证后再作为种子来源）             */
@@ -378,7 +388,14 @@ export function getContentDetail(id) {
   if (!r) return null;
   const versions = all('SELECT * FROM content_version WHERE content_item_id=? ORDER BY version_no DESC', [id]);
   const links = all('SELECT * FROM content_source_link WHERE content_item_id=?', [id]);
-  const reps = get('SELECT id,title,publisher,source_url FROM content_item WHERE duplicate_of=?', [id]);
+  const reps = all('SELECT id,title,publisher,source_url,published_at,discovered_at FROM content_item WHERE duplicate_of=?', [id]);
+  const attachments = all('SELECT * FROM content_attachment WHERE content_item_id=? ORDER BY last_seen_at DESC', [id]);
+  const extraction = get(
+    'SELECT id,source_url,raw_hash,extractor,extractor_version,status,quality,chars,note,fetched_at FROM content_extraction WHERE content_item_id=? ORDER BY fetched_at DESC LIMIT 1',
+    [id]
+  );
+  const eventGroup = getEventGroup(id);
+  const fields = getFieldEvidence('content_item', id);
   const verifications = all(
     'SELECT * FROM verification_result WHERE object_type=? AND object_id=? ORDER BY created_at DESC LIMIT 10',
     ['content_item', id]
@@ -405,24 +422,60 @@ export function getContentDetail(id) {
       body_snapshot: r.body_snapshot,
       body_chars: r.body_chars,
       note: r.note,
+      body_fingerprint: r.body_fingerprint || r.content_hash || null,
+      substantive_fingerprint: r.substantive_fingerprint || null,
+      attachment_fingerprint: r.attachment_fingerprint || null,
+      extractor: r.extractor || extraction?.extractor || null,
+      extractor_version: r.extractor_version || extraction?.extractor_version || null,
+      extraction_status: r.extraction_status || extraction?.status || null,
+      extraction_note: r.extraction_note || extraction?.note || null,
+      event_group_id: r.event_group_id || null,
     },
     versions: versions.map((v) => ({
       version_no: v.version_no,
       content_hash: v.content_hash,
+      body_fingerprint: v.body_fingerprint || v.content_hash || null,
+      substantive_fingerprint: v.substantive_fingerprint || null,
+      attachment_fingerprint: v.attachment_fingerprint || null,
       change_kind: v.change_kind,
+      change_kind_label: {
+        initial: '首次采集', body_change: '正文实质变化', attachment_change: '附件变化',
+        updated: '内容更新', minor_edit: '非实质编辑',
+      }[v.change_kind] || v.change_kind,
       change_summary: v.change_summary,
       diff_chars: v.diff_chars,
       fetched_at: v.fetched_at,
       title: v.title,
       body_chars: v.body_chars,
+      extractor: v.extractor || null,
+      extractor_version: v.extractor_version || null,
+      extraction_status: v.extraction_status || null,
     })),
     other_sources: links.map((l) => ({
-      url: l.url, publisher: l.publisher, relation: l.relation, source_category: l.source_category, similarity: l.similarity,
+      url: l.url, publisher: l.publisher, relation: l.relation,
+      source_category: l.source_category, similarity: l.similarity,
+      published_at: l.published_at, fetched_at: l.fetched_at,
+      body_chars: l.body_chars, fetch_status: l.fetch_status, note: l.note,
     })),
-    reprints: reps ? [reps] : [],
+    reprints: reps,
+    event_group: eventGroup,
+    attachments: attachments.map((a) => ({
+      id: a.id, url: a.url, file_name: a.file_name, file_type: a.file_type,
+      file_hash: a.file_hash, file_size: a.file_size, fingerprint: a.fingerprint,
+      status: a.status, discovered_at: a.discovered_at, last_seen_at: a.last_seen_at, note: a.note,
+    })),
+    extraction: extraction ? {
+      id: extraction.id, source_url: extraction.source_url, raw_hash: extraction.raw_hash,
+      extractor: extraction.extractor, extractor_version: extraction.extractor_version,
+      status: extraction.status, quality: extraction.quality, chars: extraction.chars,
+      note: extraction.note, fetched_at: extraction.fetched_at,
+    } : null,
+    fields: fields.fields,
+    field_meta: { body_hash: fields.body_hash, stale: fields.stale, invalid: fields.invalid, note: fields.note },
     verifications,
     disclosure:
-      '本条目为公开资料自动采集结果。核验状态表示证据一致性检查结论，不构成对内容真实性、准确性或投资价值的担保。',
+      '本条目为公开资料自动采集结果。字段引句为原文连续片段，字段抽取（含模型抽取）只是候选证据，' +
+      '不构成官方确认、独立审计或投资建议。',
   };
 }
 
@@ -440,7 +493,7 @@ export function normalizeBody(text) {
  * 去重顺序：canonical url_hash → 内容哈希（转载）→ 新建。
  * @returns {{action:'inserted'|'updated'|'duplicate'|'unchanged', id:string, version_no?:number}}
  */
-export function upsertContent(input, { actor = 'system:content', jobId = null } = {}) {
+function upsertContentLegacy(input, { actor = 'system:content', jobId = null } = {}) {
   const now = nowIso();
   const canonical = canonicalizeUrl(input.source_url || '');
   const urlHash = sha256(Buffer.from(canonical, 'utf8'));
@@ -488,6 +541,20 @@ export function upsertContent(input, { actor = 'system:content', jobId = null } 
         input.note || null, input.snapshot_id || null, now, existing.id,
       ]
     );
+    // 正文/字段变化：旧摘要与核验一律失效，不得沿用「已完成」状态。
+    // 仅当内容哈希确实变化时 invalidate；同一正文重复抓取（内容哈希相同）已在上面返回 unchanged。
+    invalidateContentConclusions(existing.id, '正文或结构化字段发生变化：旧摘要/核验结论失效，需要重新判断');
+    syncContentStages(existing.id, {
+      invalidate: true,
+      reason: '正文或结构化字段发生变化：旧摘要/核验结论失效，需要重新判断',
+    });
+    // 新文章/实质更新完成后立即入持久队列；同步写路径绝不等待模型。
+    // 只有标题、演示、转载、来源归档与 failed_fetch 会在入队前被挡掉。
+    try {
+      enqueueContentSummary(existing.id, { source: 'ingest', reason: '内容实质更新' });
+    } catch {
+      /* 入队失败不能回滚已经正确落库的正文；每日兜底会补入漏队项 */
+    }
     return { action: 'updated', id: existing.id, version_no: versionNo, change_summary: changeSummary };
   }
 
@@ -582,6 +649,15 @@ export function upsertContent(input, { actor = 'system:content', jobId = null } 
       detail: { title: String(input.title || '').slice(0, 120), url: input.source_url, availability },
     });
   }
+  // 新条目：写入发现/获取/解析阶段；摘要与核验为待处理。
+  syncContentStages(id);
+  // 新文章落库后只入队；不在此同步调用外部模型。正文范围由实际行决定：
+  // 仅标题不入队，仅有来源摘要按 summary_only 入队，绝不写成“已阅读全文”。
+  try {
+    enqueueContentSummary(id, { source: 'ingest', reason: '新内容入库' });
+  } catch {
+    /* 每日兜底会重新扫描漏队项 */
+  }
   return { action: 'inserted', id, availability };
 }
 
@@ -596,6 +672,469 @@ function buildChangeSummary(prev, next, body) {
   return bits.join('；');
 }
 
+/* ==================================================================== */
+/*  二·B、第一阶段：清洗记录、附件指纹、事件组与实质变化                   */
+/* ==================================================================== */
+
+function normalizeAttachmentList(list) {
+  const out = [];
+  const seen = new Set();
+  for (const a of Array.isArray(list) ? list : []) {
+    const url = String(a?.url || '').trim();
+    if (!/^https?:\/\//i.test(url) || seen.has(url)) continue;
+    seen.add(url);
+    const urlHash = sha256Text(url);
+    const fileType = String(a.file_type || (url.match(/\.([a-z0-9]{2,6})(?:\?|$)/i) || [])[1] || '').toLowerCase() || null;
+    out.push({
+      url, url_hash: urlHash, file_name: a.file_name ? String(a.file_name).slice(0, 240) : null,
+      file_type: fileType, file_hash: a.file_hash || null,
+      file_size: Number.isFinite(Number(a.file_size)) ? Number(a.file_size) : null,
+      fingerprint: `${url}|${a.file_hash || ''}`,
+    });
+  }
+  return out;
+}
+
+function storeExtraction(contentItemId, contentVersionId, {
+  extraction = null, rawHtml = null, rawText = null, sourceUrl = null, fetchedAt = null,
+} = {}) {
+  const ext = extraction || {};
+  const html = ext.raw_html || rawHtml || null;
+  const text = ext.raw_text || rawText || null;
+  const cleaned = cleanText(ext.text || '');
+  if (!html && !text && !cleaned) return null;
+  const rawHash = html ? sha256Text(html) : text ? sha256Text(text) : null;
+  const extractor = ext.extractor || (html ? 'caller_html' : text ? 'caller_text' : 'caller');
+  const version = ext.extractor_version || CLEANER_VERSION;
+  const chars = cleaned.length;
+  const dup = get(
+    `SELECT id FROM content_extraction
+      WHERE content_item_id=? AND COALESCE(raw_hash,'')=COALESCE(?,'') AND extractor=?
+        AND extractor_version=? AND chars=? ORDER BY fetched_at DESC LIMIT 1`,
+    [contentItemId, rawHash, extractor, version, chars]
+  );
+  if (dup) {
+    if (contentVersionId) {
+      run('UPDATE content_extraction SET content_version_id=COALESCE(content_version_id,?) WHERE id=?', [contentVersionId, dup.id]);
+    }
+    return dup.id;
+  }
+  const id = newId('CEX');
+  run(
+    `INSERT INTO content_extraction
+       (id,content_item_id,content_version_id,source_url,raw_hash,raw_html,raw_text,cleaned_text,
+        extractor,extractor_version,status,quality,chars,note,fetched_at,created_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    [
+      id, contentItemId, contentVersionId || null, sourceUrl || null, rawHash,
+      html ? String(html).slice(0, 1_000_000) : null,
+      text ? String(text).slice(0, 1_000_000) : null,
+      cleaned.slice(0, 200_000), extractor, version,
+      ext.status || (cleaned ? 'ok' : 'failed'), ext.quality || null,
+      chars, ext.note || null, fetchedAt || nowIso(), nowIso(),
+    ]
+  );
+  return id;
+}
+
+/**
+ * 同步附件清单并返回当前指纹。
+ * 同 URL 的附件行保留；本次清单中不存在的旧附件标 missing（不删除）。
+ */
+export function syncAttachments(contentItemId, attachments = [], { actor = 'system:content' } = {}) {
+  const incoming = normalizeAttachmentList(attachments);
+  const now = nowIso();
+  const existing = all('SELECT * FROM content_attachment WHERE content_item_id=?', [contentItemId]);
+  const byHash = new Map(existing.map((r) => [r.url_hash, r]));
+  const keep = new Set(incoming.map((a) => a.url_hash));
+  let added = 0;
+  let changed = 0;
+  for (const a of incoming) {
+    const prev = byHash.get(a.url_hash);
+    if (!prev) {
+      run(
+        `INSERT INTO content_attachment
+           (id,content_item_id,url,url_hash,file_name,file_type,file_hash,file_size,fingerprint,
+            discovered_at,last_seen_at,status,note)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [newId('CAT'), contentItemId, a.url, a.url_hash, a.file_name, a.file_type, a.file_hash,
+          a.file_size, a.fingerprint, now, now, 'referenced', null]
+      );
+      added += 1;
+    } else {
+      const hashChanged = prev.file_hash && a.file_hash && prev.file_hash !== a.file_hash;
+      if (hashChanged || prev.status === 'missing') changed += 1;
+      run(
+        `UPDATE content_attachment SET file_name=COALESCE(?,file_name), file_type=COALESCE(?,file_type),
+           file_hash=COALESCE(?,file_hash), file_size=COALESCE(?,file_size), fingerprint=?,
+           last_seen_at=?, status='referenced', note=NULL WHERE id=?`,
+        [a.file_name, a.file_type, a.file_hash, a.file_size, a.fingerprint, now, prev.id]
+      );
+    }
+  }
+  let missing = 0;
+  for (const prev of existing) {
+    if (keep.has(prev.url_hash)) continue;
+    if (prev.status !== 'missing') missing += 1;
+    run("UPDATE content_attachment SET status='missing', note='本次抓取未再发现该附件（保留历史记录）' WHERE id=?", [prev.id]);
+  }
+  const fingerprint = attachmentFingerprint(incoming);
+  audit({
+    actor, action: 'content.attachments_sync', objectType: 'content_item', objectId: contentItemId,
+    detail: { total: incoming.length, added, changed, missing, fingerprint },
+  });
+  return { fingerprint, total: incoming.length, added, changed, missing, attachments: incoming };
+}
+
+/** 同文不同 URL：建立事件组，保留每条来源；不按相似标题猜测。 */
+export function ensureEventGroup(representativeId, memberId, {
+  eventKey, matchBasis = '正文 SHA-256 完全一致；非标题相似', relation = 'reprint',
+} = {}) {
+  const now = nowIso();
+  const key = String(eventKey || '').trim();
+  if (!key) return null;
+  let group = get('SELECT * FROM content_event_group WHERE event_key=?', [key]);
+  if (!group) {
+    const id = newId('CEG');
+    run(
+      `INSERT INTO content_event_group
+         (id,event_key,representative_content_id,match_basis,created_at,updated_at)
+       VALUES (?,?,?,?,?,?)`,
+      [id, key, representativeId, matchBasis, now, now]
+    );
+    group = { id };
+  }
+  const add = (contentId, rel) => {
+    const exists = get(
+      'SELECT id FROM content_event_member WHERE event_group_id=? AND content_item_id=?',
+      [group.id, contentId]
+    );
+    if (!exists) {
+      run(
+        `INSERT INTO content_event_member (id,event_group_id,content_item_id,relation,match_basis,added_at)
+         VALUES (?,?,?,?,?,?)`,
+        [newId('CEM'), group.id, contentId, rel, matchBasis, now]
+      );
+    }
+    run('UPDATE content_item SET event_group_id=? WHERE id=?', [group.id, contentId]);
+  };
+  add(representativeId, 'representative');
+  if (memberId && memberId !== representativeId) add(memberId, relation);
+  run('UPDATE content_event_group SET updated_at=? WHERE id=?', [now, group.id]);
+  return group.id;
+}
+
+function getEventGroup(contentItemId) {
+  const item = get('SELECT event_group_id FROM content_item WHERE id=?', [contentItemId]);
+  if (!item?.event_group_id) return null;
+  const group = get('SELECT * FROM content_event_group WHERE id=?', [item.event_group_id]);
+  if (!group) return null;
+  const members = all(
+    `SELECT m.relation, m.match_basis, m.added_at, c.id, c.title, c.publisher, c.source_url,
+            c.published_at, c.discovered_at, c.collected_at, c.body_availability
+       FROM content_event_member m JOIN content_item c ON c.id=m.content_item_id
+      WHERE m.event_group_id=? ORDER BY m.relation='representative' DESC, m.added_at`,
+    [group.id]
+  );
+  return {
+    id: group.id, event_key: group.event_key, match_basis: group.match_basis,
+    representative_content_id: group.representative_content_id,
+    members: members.map((m) => ({
+      id: m.id, relation: m.relation, match_basis: m.match_basis,
+      publisher: m.publisher, source_url: m.source_url, published_at: m.published_at,
+      discovered_at: m.discovered_at, collected_at: m.collected_at,
+      title: m.title, body_availability: m.body_availability, added_at: m.added_at,
+    })),
+  };
+}
+
+/**
+ * 写入 / 更新一条公开内容（幂等，docs/86 第一阶段第 2 节）。
+ * 去重顺序：canonical url_hash → 内容哈希（转载）→ 新建。
+ * 变化口径：
+ *   body_change        实质正文变化（保存版本、摘要/核验失效、重抽字段）
+ *   attachment_change  仅附件清单变化（保存版本，摘要不重生成）
+ *   none               无实质变化（日期页脚/版权行变化只更新提取记录）
+ */
+function upsertContentCore(input, { actor = 'system:content', jobId = null } = {}) {
+  const now = nowIso();
+  const canonical = canonicalizeUrl(input.source_url || '');
+  const urlHash = sha256(Buffer.from(canonical, 'utf8'));
+  const providedExtraction = input.extraction || null;
+  const body = normalizeBody(input.body_snapshot ?? providedExtraction?.text ?? '');
+  const rawHtml = providedExtraction?.raw_html || input.raw_html || null;
+  // 调用方只给原始 HTML、未给清洗结果时，在同步写入路径做一次规则清洗；
+  // 绝不把空白提取记录标成成功。
+  const extraction = providedExtraction || (rawHtml ? {
+    text: body,
+    raw_html: rawHtml,
+    extractor: 'deterministic_html',
+    extractor_version: CLEANER_VERSION,
+    status: body ? 'ok' : 'failed',
+    quality: body ? classifyPage(body).kind : 'empty',
+    note: '调用方提供清洗后正文；原始 HTML 已保存，规则清洗版本已记录。',
+  } : null);
+  const fp = bodyFingerprints(body);
+  const contentHash = body.length >= 80 ? fp.body_hash : null;
+  const cls = classifySource(input.source_url, { hint: input.source_category });
+  const rawHash = rawHtml ? sha256Text(rawHtml) : null;
+  const extractor = extraction?.extractor || input.extractor || (rawHtml ? 'caller_html' : body ? 'caller_text' : 'none');
+  const extractorVersion = extraction?.extractor_version || input.extractor_version || CLEANER_VERSION;
+  const extractionStatus = extraction?.status || (body ? 'ok' : 'failed');
+  const extractionNote = extraction?.note || input.extraction_note || null;
+  const attachmentsIn = Array.isArray(input.attachments)
+    ? normalizeAttachmentList(input.attachments)
+    : rawHtml ? normalizeAttachmentList(extractAttachmentLinks(rawHtml, input.source_url)) : null;
+  const attachmentsFp = attachmentsIn ? attachmentFingerprint(attachmentsIn) : null;
+
+  const existing = get('SELECT * FROM content_item WHERE url_hash=?', [urlHash]);
+  if (existing) {
+    const prevBody = normalizeBody(existing.body_snapshot || '');
+    const prevFp = bodyFingerprints(prevBody);
+    const prevBodyHash = existing.body_fingerprint || existing.content_hash || prevFp.body_hash;
+    const prevSubHash = existing.substantive_fingerprint || prevFp.substantive_hash;
+    const prevAttFp = existing.attachment_fingerprint || null;
+    const bodyChanged = prevBodyHash !== fp.body_hash;
+    const substantiveChanged = prevSubHash !== fp.substantive_hash;
+    const attachmentChanged = attachmentsIn !== null && prevAttFp !== null && prevAttFp !== attachmentsFp;
+    const attSync = attachmentsIn !== null ? syncAttachments(existing.id, attachmentsIn, { actor }) : null;
+
+    if (!substantiveChanged && !attachmentChanged) {
+      // 日期页脚/版权行变化：更新指纹与提取记录，但不保存新版本、不动摘要/核验。
+      run(
+        `UPDATE content_item SET content_hash=?, body_fingerprint=?, substantive_fingerprint=?,
+           attachment_fingerprint=COALESCE(?,attachment_fingerprint), extractor=?, extractor_version=?,
+           extraction_status=?, extraction_note=?, raw_html_hash=COALESCE(?,raw_html_hash), cleaned_at=?,
+           collected_at=COALESCE(?,collected_at), updated_at=? WHERE id=?`,
+        [bodyChanged ? fp.body_hash : existing.content_hash, fp.body_hash, fp.substantive_hash,
+          attachmentsFp, extractor, extractorVersion, extractionStatus, extractionNote,
+          rawHash, body ? now : existing.cleaned_at, input.collected_at || null, now, existing.id]
+      );
+      storeExtraction(existing.id, null, {
+        extraction, rawHtml, rawText: input.raw_text || null,
+        sourceUrl: input.source_url, fetchedAt: now,
+      });
+      return {
+        action: 'unchanged', id: existing.id, no_substantive_change: true,
+        change_kind: 'none', attachment_changed: false,
+        attachment_fingerprint: attSync?.fingerprint || existing.attachment_fingerprint || null,
+        body_fingerprint: fp.body_hash,
+      };
+    }
+
+    const prevVer = get('SELECT MAX(version_no) n FROM content_version WHERE content_item_id=?', [existing.id])?.n || 0;
+    const versionNo = prevVer + 1;
+    const changeKind = substantiveChanged ? 'body_change' : 'attachment_change';
+    const diff = substantiveChanged ? diffSummary(prevBody, body) : {
+      summary: `附件清单变化：共 ${attSync?.total ?? attachmentsIn?.length ?? 0} 个公开文件；` +
+        `新增 ${attSync?.added ?? 0}、变更 ${attSync?.changed ?? 0}、本次未再发现 ${attSync?.missing ?? 0}`,
+      diff_chars: 0,
+    };
+    const titleChanged = String(existing.title || '') !== String(input.title || existing.title || '');
+    const changeSummary = substantiveChanged
+      ? `${titleChanged ? '标题变化；' : ''}${diff.summary}`
+      : `${diff.summary}（正文未发生实质变化，不重生成摘要）`;
+    const versionId = newId('CVR');
+    run(
+      `INSERT INTO content_version (id,content_item_id,version_no,content_hash,title,body_snapshot,body_chars,
+        change_kind,change_summary,diff_chars,snapshot_id,fetched_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [
+        versionId, existing.id, versionNo, fp.body_hash || existing.content_hash || '',
+        String(input.title || existing.title).slice(0, 400), body.slice(0, 200000), body.length,
+        changeKind, changeSummary, Math.abs(body.length - (existing.body_chars || 0)),
+        input.snapshot_id || null, now,
+      ]
+    );
+    run(
+      `UPDATE content_version SET body_fingerprint=?, substantive_fingerprint=?, attachment_fingerprint=?,
+         raw_html=?, extractor=?, extractor_version=?, extraction_status=?, extraction_note=? WHERE id=?`,
+      [fp.body_hash, fp.substantive_hash, attachmentsFp, rawHtml ? String(rawHtml).slice(0, 1_000_000) : null,
+        extractor, extractorVersion, extractionStatus, extractionNote, versionId]
+    );
+    run(
+      `UPDATE content_item SET title=?, summary=COALESCE(?,summary), auto_summary=COALESCE(?,auto_summary),
+         auto_summary_kind=COALESCE(?,auto_summary_kind), published_at=COALESCE(?,published_at),
+         record_kind=COALESCE(?,record_kind), body_snapshot=?, body_chars=?, content_hash=?,
+         body_fingerprint=?, substantive_fingerprint=?, attachment_fingerprint=COALESCE(?,attachment_fingerprint),
+         extractor=?, extractor_version=?, extraction_status=?, extraction_note=?,
+         raw_html_hash=COALESCE(?,raw_html_hash), cleaned_at=?, collected_at=COALESCE(?,collected_at),
+         body_availability=?, note=COALESCE(?,note), snapshot_id=COALESCE(?,snapshot_id), updated_at=?,
+         process_status='fetched'
+       WHERE id=?`,
+      [
+        String(input.title || existing.title).slice(0, 400), input.summary || null,
+        input.auto_summary || null, input.auto_summary_kind || null,
+        input.published_at || null, input.record_kind || null,
+        body.slice(0, 200000), body.length, fp.body_hash,
+        fp.body_hash, fp.substantive_hash, attachmentsFp,
+        extractor, extractorVersion, extractionStatus, extractionNote,
+        rawHash, now, input.collected_at || null,
+        input.body_availability || existing.body_availability,
+        input.note || null, input.snapshot_id || null, now, existing.id,
+      ]
+    );
+    storeExtraction(existing.id, versionId, {
+      extraction, rawHtml, rawText: input.raw_text || null,
+      sourceUrl: input.source_url, fetchedAt: now,
+    });
+    if (substantiveChanged) {
+      // 只有实质正文变化才失效摘要/核验、重抽字段、重新入队。
+      run("UPDATE content_item SET verification_status=NULL WHERE id=?", [existing.id]);
+      invalidateContentConclusions(existing.id, '实质正文发生变化：旧摘要/核验结论失效，需要重新判断');
+      syncContentStages(existing.id, {
+        invalidate: true, reason: '实质正文发生变化：旧摘要/核验结论失效，需要重新判断',
+      });
+      markFieldsStale('content_item', existing.id, '实质正文变化：旧字段引句证据失效');
+      try { extractDeterministicFields('content_item', existing.id, { bodyHash: fp.body_hash, actor }); } catch { /* 字段失败不阻断正文 */ }
+      try {
+        enqueueContentSummary(existing.id, { source: 'ingest', reason: '内容实质更新' });
+      } catch { /* 入队失败由每日兜底 */ }
+    } else {
+      syncContentStages(existing.id, { reason: '附件清单变化：正文未变，摘要保持有效' });
+    }
+    return {
+      action: 'updated', id: existing.id, version_no: versionNo, change_kind: changeKind,
+      change_summary: changeSummary, attachment_changed: attachmentChanged,
+      attachment_fingerprint: attachmentsFp,
+    };
+  }
+
+  // 内容哈希命中 → 同一篇的转载：建关联、保留独立来源记录，不重复统计。
+  if (contentHash) {
+    const rep = get(
+      `SELECT * FROM content_item WHERE content_hash=? AND duplicate_of IS NULL ORDER BY collected_at ASC LIMIT 1`,
+      [contentHash]
+    );
+    if (rep) {
+      const id = newId('CNT');
+      run(
+        `INSERT INTO content_item (id,content_type,record_kind,title,publisher,author,published_at,discovered_at,collected_at,
+          source_url,canonical_url,url_hash,content_hash,source_category,authority_tier,body_availability,language,
+          summary,body_snapshot,body_chars,duplicate_of,process_status,is_demo,note,created_at,updated_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [
+          id, input.content_type || rep.content_type, input.record_kind || 'article',
+          String(input.title || rep.title).slice(0, 400),
+          input.publisher || rep.publisher, input.author || null, input.published_at || rep.published_at,
+          now, now, input.source_url, canonical, urlHash, contentHash, cls.source_category, cls.authority_tier,
+          input.body_availability || rep.body_availability, 'zh', input.summary || null, null, 0, rep.id,
+          'skipped_duplicate', 0, '同内容多站转载，已关联到代表条目，不重复统计。', now, now,
+        ]
+      );
+      run(
+        `UPDATE content_item SET body_fingerprint=?, substantive_fingerprint=?, attachment_fingerprint=?,
+           extractor=?, extractor_version=?, extraction_status=?, extraction_note=?, raw_html_hash=?, cleaned_at=?
+         WHERE id=?`,
+        [fp.body_hash, fp.substantive_hash, attachmentsFp, extractor, extractorVersion,
+          extractionStatus, extractionNote, rawHash, now, id]
+      );
+      run(
+        `INSERT OR IGNORE INTO content_source_link (id,content_item_id,url,url_hash,publisher,source_category,relation,similarity,
+           body_snapshot,body_chars,published_at,fetch_status,fetched_at,note,created_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [
+          newId('CSL'), rep.id, input.source_url, urlHash, input.publisher || null, cls.source_category, 'reprint', 1,
+          body ? body.slice(0, 200000) : null, body.length, input.published_at || null,
+          body ? 'ok' : 'url_only', now, '内容哈希一致（第二来源正文已留存）', now,
+        ]
+      );
+      ensureEventGroup(rep.id, id, { eventKey: contentHash });
+      return { action: 'duplicate', id, representative_id: rep.id, event_grouped: true };
+    }
+  }
+
+  const id = newId('CNT');
+  const availability =
+    input.body_availability ||
+    (body.length >= 1200 ? 'full_text' : body.length > 0 ? 'partial' : input.summary ? 'abstract_only' : 'metadata_only');
+  run(
+    `INSERT INTO content_item (id,content_type,record_kind,title,publisher,author,published_at,discovered_at,collected_at,
+      source_url,canonical_url,url_hash,content_hash,source_category,authority_tier,body_availability,language,
+      summary,auto_summary,auto_summary_kind,auto_summary_at,key_points_json,claims_json,topics_json,methodology_ids_json,
+      industry,body_snapshot,body_chars,public_files_json,process_status,is_demo,source_provider_id,snapshot_id,
+      first_seen_job_id,note,created_at,updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    [
+      id, input.content_type || 'industry_news', input.record_kind || 'article',
+      String(input.title || '(无标题)').slice(0, 400),
+      input.publisher || null, input.author || null, input.published_at || null, now,
+      input.collected_at || (body ? now : null), input.source_url, canonical, urlHash, contentHash,
+      cls.source_category, input.authority_tier || cls.authority_tier, availability, input.language || 'zh',
+      input.summary || null, input.auto_summary || null, input.auto_summary_kind || null,
+      input.auto_summary ? now : null,
+      j(input.key_points || []), j(input.claims || []), j(input.topics || []),
+      j(input.methodology_ids || []), input.industry || null, body.slice(0, 200000) || null, body.length,
+      j(input.public_files || []), body ? 'fetched' : 'new', input.is_demo ? 1 : 0,
+      input.source_provider_id || null, input.snapshot_id || null, jobId, input.note || null, now, now,
+    ]
+  );
+  run(
+    `UPDATE content_item SET body_fingerprint=?, substantive_fingerprint=?, attachment_fingerprint=?,
+       extractor=?, extractor_version=?, extraction_status=?, extraction_note=?, raw_html_hash=?, cleaned_at=?
+     WHERE id=?`,
+    [fp.body_hash, fp.substantive_hash, attachmentsFp, extractor, extractorVersion,
+      extractionStatus, extractionNote, rawHash, body ? now : null, id]
+  );
+  const versionId = newId('CVR');
+  run(
+    `INSERT INTO content_version (id,content_item_id,version_no,content_hash,title,body_snapshot,body_chars,
+      change_kind,change_summary,diff_chars,snapshot_id,fetched_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+    [versionId, id, 1, fp.body_hash || sha256(Buffer.from(`${input.title}|${now}`, 'utf8')),
+      String(input.title || '').slice(0, 400), body.slice(0, 200000), body.length,
+      'initial', '首次采集', 0, input.snapshot_id || null, now]
+  );
+  run(
+    `UPDATE content_version SET body_fingerprint=?, substantive_fingerprint=?, attachment_fingerprint=?,
+       raw_html=?, extractor=?, extractor_version=?, extraction_status=?, extraction_note=? WHERE id=?`,
+    [fp.body_hash, fp.substantive_hash, attachmentsFp, rawHtml ? String(rawHtml).slice(0, 1_000_000) : null,
+      extractor, extractorVersion, extractionStatus, extractionNote, versionId]
+  );
+  storeExtraction(id, versionId, {
+    extraction, rawHtml, rawText: input.raw_text || null,
+    sourceUrl: input.source_url, fetchedAt: now,
+  });
+  if (attachmentsIn !== null) syncAttachments(id, attachmentsIn, { actor });
+  for (const link of input.other_sources || []) {
+    try {
+      const lc = canonicalizeUrl(link.url);
+      run(
+        `INSERT OR IGNORE INTO content_source_link (id,content_item_id,url,url_hash,publisher,source_category,relation,similarity,note,created_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?)`,
+        [
+          newId('CSL'), id, link.url, sha256(Buffer.from(lc, 'utf8')), link.publisher || null,
+          link.source_category || null, link.relation || 'reference', link.similarity ?? null, link.note || null, now,
+        ]
+      );
+    } catch {
+      /* 单条关联失败不影响主记录 */
+    }
+  }
+  if (!input.silent) {
+    audit({
+      actor, action: 'content.insert', objectType: 'content_item', objectId: id,
+      detail: { title: String(input.title || '').slice(0, 120), url: input.source_url, availability },
+    });
+  }
+  syncContentStages(id);
+  try { extractDeterministicFields('content_item', id, { bodyHash: fp.body_hash, actor }); } catch { /* 字段失败不阻断正文 */ }
+  try { enqueueContentSummary(id, { source: 'ingest', reason: '新内容入库' }); } catch { /* 每日兜底 */ }
+  return { action: 'inserted', id, availability, version_no: 1, change_kind: 'initial' };
+}
+
+/**
+ * 对外统一入口：先写业务表，再在索引已完整构建时做单条增量刷新。
+ * 索引未构建时跳过（避免半套索引），索引失败不影响内容入库。
+ */
+export function upsertContent(input, opts = {}) {
+  const out = upsertContentCore(input, opts);
+  try {
+    if (out?.id) refreshSearchEntity('content', out.id, { actor: opts.actor || 'system:content' });
+  } catch { /* 索引失败不阻断内容写入；每日/后台会再刷新 */ }
+  return out;
+}
+
 /** 标记为演示条目（不计入业务统计） */
 export function markDemo(id, note = '演示条目：用于界面与流程验证，不计入业务统计。') {
   run('UPDATE content_item SET is_demo=1, note=?, updated_at=? WHERE id=?', [note, nowIso(), id]);
@@ -608,8 +1147,18 @@ export function deleteContent(user, id) {
   if (!r) return { error: '内容条目不存在', status: 404 };
   run('DELETE FROM content_version WHERE content_item_id=?', [id]);
   run('DELETE FROM content_source_link WHERE content_item_id=?', [id]);
+  run('DELETE FROM content_extraction WHERE content_item_id=?', [id]);
+  run('DELETE FROM content_attachment WHERE content_item_id=?', [id]);
+  run('DELETE FROM field_evidence WHERE entity_type=? AND entity_id=?', ['content_item', id]);
+  const groups = all('SELECT id FROM content_event_group WHERE representative_content_id=?', [id]);
+  for (const g of groups) {
+    run('DELETE FROM content_event_member WHERE event_group_id=?', [g.id]);
+    run('DELETE FROM content_event_group WHERE id=?', [g.id]);
+  }
+  run('DELETE FROM content_event_member WHERE content_item_id=?', [id]);
   run('DELETE FROM verification_result WHERE object_type=? AND object_id=?', ['content_item', id]);
   run('DELETE FROM content_item WHERE id=?', [id]);
+  try { removeSearchEntity('content', id); } catch { /* 索引可重建 */ }
   audit({ actor: user.name, actorRole: user.role, action: 'content.delete', objectType: 'content_item', objectId: id, detail: { title: r.title } });
   return { ok: true, id };
 }
@@ -1015,6 +1564,9 @@ export async function collectFromSearch({
       let snapshotId = null;
       let fetchNote = null;
       let actualFetchProvider = null;
+      let extraction = null;
+      let rawHtml = null;
+      let attachments = null;
 
       // 只有搜索摘要时，明确标注「未获取全文」；不声称已读全文
       if (fetchBody && body.length < 1200) {
@@ -1027,11 +1579,20 @@ export async function collectFromSearch({
             : `正文抓取失败（${fr.reason}）：${fr.message || ''}；仅保留搜索摘要。`;
         } else {
           actualFetchProvider = fr.connection_id || fr.provider_id || null;
-          body = normalizeBody(fr.content);
-          availability = availabilityFromFetch(fr, body);
+          rawHtml = fr.raw_html || null;
+          extraction = await cleanContent({
+            rawHtml, markdown: rawHtml ? null : fr.content,
+            rawText: rawHtml ? null : fr.content, url: hit.url,
+          });
+          body = normalizeBody(extraction.text || fr.content);
+          // 只有取得结构性正文才升级全文；不因字符数变长自动升级。
+          availability = extraction.quality === 'article'
+            ? (fr.availability || 'full_text')
+            : (body ? 'partial' : availabilityFromFetch(fr, body));
+          if (rawHtml) attachments = extractAttachmentLinks(rawHtml, hit.url);
           tally.fetched += 1;
           if (fr.fallback_used) tally.fallback_used += 1;
-          log(`  抓取正文成功：${hit.title?.slice(0, 40)}（${fr.chars} 字符${fr.fallback_used ? '，备用通道' : ''}）`);
+          log(`  抓取正文成功：${hit.title?.slice(0, 40)}（${fr.chars} 字符，${extraction.extractor}${fr.fallback_used ? '，备用通道' : ''}）`);
         }
       }
 
@@ -1045,6 +1606,7 @@ export async function collectFromSearch({
             sourceId: null,
             parseQuality: body ? 'good' : 'snippet_only',
             parseNote: [fetchNote || (hit.raw_content ? '搜索 API 直接返回正文' : '仅搜索摘要，未读取全文'),
+              extraction ? `清洗器：${extraction.extractor} ${extraction.extractor_version}（${extraction.status}）` : null,
               `搜索连接：${res.provider_id || provider.id}`,
               actualFetchProvider ? `正文抓取连接：${actualFetchProvider}` : null].filter(Boolean).join('；'),
             res: {
@@ -1078,6 +1640,9 @@ export async function collectFromSearch({
           claims,
           topics: [q.group_label, q.term],
           body_snapshot: body,
+          raw_html: rawHtml,
+          extraction,
+          attachments,
           snapshot_id: snapshotId,
           source_provider_id: res.provider_id || provider.id,
           note: fetchNote,
@@ -1142,27 +1707,41 @@ export async function collectFromSearch({
  */
 export async function repairIncompleteContent({
   actor = 'system:evidence-loop', limit = 8, jobId = null,
-  connection = null, fetcher = fetchUrlContent, verify = true, offset = null, round = 1,
+  connection = null, fetcher = fetchUrlContent, verify = true, offset = null, round = 1, ids = null,
 } = {}) {
   const conn = connection || pickFetchConnection();
   const out = { attempted: 0, improved: 0, unchanged: 0, failed: 0, verified: 0, items: [] };
   if (!conn) return { ...out, unavailable: true, reason: '未配置可用的网页抓取连接' };
   const cfg = verifyConfig();
   const cap = Math.min(Math.max(Number(limit) || 8, 1), 30);
-  const total = Number(get(`SELECT COUNT(*) n FROM content_item WHERE is_demo=0 AND duplicate_of IS NULL
-    AND record_kind='article' AND source_url IS NOT NULL
-    AND COALESCE(body_availability,'metadata_only')!='full_text'`)?.n || 0);
+  const selectedIds = Array.isArray(ids)
+    ? [...new Set(ids.map(String).filter(Boolean))].slice(0, Math.min(cap, 20))
+    : null;
+  const total = selectedIds
+    ? selectedIds.length
+    : Number(get(`SELECT COUNT(*) n FROM content_item WHERE is_demo=0 AND duplicate_of IS NULL
+      AND record_kind='article' AND source_url IS NOT NULL
+      AND COALESCE(body_availability,'metadata_only')!='full_text'`)?.n || 0);
   const dayNo = Math.floor(Date.parse(todayCst()) / 86400000);
-  const start = total ? (offset === null
+  const start = selectedIds ? 0 : (total ? (offset === null
     ? (dayNo * cap + (Math.max(1, Number(round) || 1) - 1) * cap) % total
-    : Math.max(0, Number(offset) || 0) % total) : 0;
-  const rows = all(
-    `SELECT * FROM content_item WHERE is_demo=0 AND duplicate_of IS NULL
-       AND record_kind='article' AND source_url IS NOT NULL
-       AND COALESCE(body_availability,'metadata_only') != 'full_text'
-     ORDER BY COALESCE(published_at,'') DESC, created_at DESC LIMIT ? OFFSET ?`,
-    [cap, start]
-  );
+    : Math.max(0, Number(offset) || 0) % total) : 0);
+  const rows = selectedIds
+    ? all(
+      `SELECT * FROM content_item WHERE id IN (${selectedIds.map(() => '?').join(',')})
+         AND is_demo=0 AND duplicate_of IS NULL
+         AND record_kind='article' AND source_url IS NOT NULL
+         AND COALESCE(body_availability,'metadata_only')!='full_text'
+       ORDER BY COALESCE(published_at,'') DESC, created_at DESC LIMIT ?`,
+      [...selectedIds, cap]
+    )
+    : all(
+      `SELECT * FROM content_item WHERE is_demo=0 AND duplicate_of IS NULL
+         AND record_kind='article' AND source_url IS NOT NULL
+         AND COALESCE(body_availability,'metadata_only') != 'full_text'
+       ORDER BY COALESCE(published_at,'') DESC, created_at DESC LIMIT ? OFFSET ?`,
+      [cap, start]
+    );
   for (const item of rows) {
     out.attempted += 1;
     let fr;
@@ -1174,28 +1753,45 @@ export async function repairIncompleteContent({
       continue;
     }
     try {
-    const body = normalizeBody(fr.content);
-    const availability = availabilityFromFetch(fr, body);
+    const extraction = await cleanContent({
+      rawHtml: fr.raw_html || fr.html || null,
+      markdown: (fr.raw_html || fr.html) ? null : fr.content,
+      rawText: (fr.raw_html || fr.html) ? null : fr.content,
+      url: item.source_url,
+    });
+    if (String(extraction.text || '').trim().length < 60 && String(fr.content || '').trim().length > String(extraction.text || '').length) {
+      extraction.text = String(fr.content);
+      extraction.status = 'fallback';
+      extraction.note = [extraction.note, 'HTML 清洗结果过短，使用抓取器返回文本'].filter(Boolean).join('；');
+    }
+    const body = normalizeBody(extraction.text || fr.content);
+    const availability = extraction.quality === 'article'
+      ? (fr.availability || 'full_text')
+      : (body ? 'partial' : availabilityFromFetch(fr, body));
+    const rawHtml = extraction.raw_html || fr.raw_html || fr.html || null;
+    const attachments = rawHtml ? extractAttachmentLinks(rawHtml, item.source_url) : null;
     if (availability !== 'full_text' || body.length < Math.max(200, Number(cfg.min_body_chars) || 400) ||
         (Number(item.body_chars || 0) > 0 && body.length < Number(item.body_chars) * 0.8)) {
       out.unchanged += 1;
-      out.items.push({ id: item.id, status: 'insufficient', reason: '抓取结果仍不是可核验全文，或正文较原归档明显缩短' });
+      out.items.push({ id: item.id, status: 'insufficient', reason: '抓取结果仍不是可核验全文，或正文较原归档明显缩短', extractor: extraction.extractor });
       continue;
     }
     const snap = recordSnapshot({
       // source_snapshot.source_id 指向 datasource_config，不是 web_fetch_connection。
       // 抓取连接 ID 只放说明，避免把两类配置混为同一外键。
-      url: item.source_url, sourceId: null, parser: 'content_evidence_refetch',
-      parseQuality: 'good', parseNote: `定向补采取得公开全文；抓取连接 ${conn.id || '未命名'}`,
+      url: item.source_url, sourceId: null, parser: `content_evidence_refetch:${extraction.extractor}`,
+      parseQuality: extraction.status === 'failed' ? 'failed' : extraction.quality === 'article' ? 'good' : 'partial',
+      parseNote: `定向补采取得公开正文；抓取连接 ${conn.id || '未命名'}；清洗器 ${extraction.extractor} ${extraction.extractor_version}（${extraction.status}）`,
       res: { status: 200, content_type: 'text/plain; charset=utf-8',
         hash: sha256(Buffer.from(body, 'utf8')), bytes: Buffer.byteLength(body, 'utf8'), body },
     });
-    const date = item.published_at ? null : extractPublishedDate(fr.raw_html || fr.html || '', { url: item.source_url, text: body });
+    const date = item.published_at ? null : extractPublishedDate(rawHtml || '', { url: item.source_url, text: body });
     const saved = upsertContent({
       title: item.title, source_url: item.source_url, content_type: item.content_type,
       record_kind: item.record_kind, publisher: item.publisher,
       published_at: item.published_at || date?.published_at || null,
       summary: item.summary, body_snapshot: body, body_availability: 'full_text',
+      raw_html: rawHtml, extraction, attachments,
       snapshot_id: snap.id, source_category: item.source_category,
       note: `证据循环：原始来源全文补采；${date?.note || '发布日期沿用原记录或保持未披露'}`,
     }, { actor, jobId });
@@ -1204,9 +1800,12 @@ export async function repairIncompleteContent({
       run(`UPDATE content_item SET body_availability='full_text', snapshot_id=?,
              verification_status=NULL, updated_at=? WHERE id=? AND body_availability!='full_text'`,
         [snap.id, nowIso(), item.id]);
+      // 证据可获得性变化也会影响摘要/核验的输入范围，必须重新判断。
+      invalidateContentConclusions(item.id, '正文可获得性由摘要/元数据升级为全文：旧摘要/核验结论失效');
+      syncContentStages(item.id);
     }
     out.improved += 1;
-    out.items.push({ id: item.id, status: 'improved', snapshot_id: snap.id });
+    out.items.push({ id: item.id, status: 'improved', snapshot_id: snap.id, extractor: extraction.extractor });
     audit({ actor, action: 'content.evidence_refetch', objectType: 'content_item', objectId: item.id,
       detail: { source_url: item.source_url, before: item.body_availability, after: 'full_text', snapshot_id: snap.id } });
     if (verify) {
@@ -1237,14 +1836,16 @@ export async function repairIncompleteContent({
 export async function collectFromSeedSources({
   actor = 'system:collect', seedIds = null, fetchLimit = 12, maxArticlesPerSource = 4,
   verify = false, jobId = null, log = () => {}, archiveHomepages = true, seedSources = null,
+  fetchPage: fetchPageOverride = null, verifyFn = null, connection = null,
 } = {}) {
-  const conn = pickFetchConnection();
+  const conn = connection || pickFetchConnection();
   const pool = Array.isArray(seedSources) && seedSources.length ? seedSources : SEED_SOURCES;
   const seeds = pool.filter((s) => s.enabled && (!seedIds || seedIds.includes(s.id))).slice(0, fetchLimit);
   const tally = {
     ok: true, attempted: 0, fetched: 0, failed: 0, inserted: 0, updated: 0, unchanged: 0,
     archive_records: 0, articles_discovered: 0, articles_fetched: 0, articles_failed: 0,
     published_dated: 0, published_undated: 0, failures: [],
+    verified: 0, verify_results: {}, verify_failed: 0,
     provider: conn ? { id: conn.id, name: conn.name } : null,
   };
   if (!conn) {
@@ -1252,9 +1853,12 @@ export async function collectFromSeedSources({
   }
   const maxArticles = Math.max(0, Math.min(Number(maxArticlesPerSource) || 0, 10));
   const fetchedPages = new Map();
-  const fetchPage = async (url) => {
-    if (!fetchedPages.has(url)) fetchedPages.set(url, await fetchWithFallback(url, { attempts: 2 }));
-    return fetchedPages.get(url);
+  const touchedArticleIds = new Set();
+  const doFetch = fetchPageOverride || fetchWithFallback;
+  const fetchPage = async (url, opts = {}) => {
+    const key = `${url}|${JSON.stringify(opts)}`;
+    if (!fetchedPages.has(key)) fetchedPages.set(key, await doFetch(url, opts));
+    return fetchedPages.get(key);
   };
 
   for (const s of seeds) {
@@ -1316,7 +1920,7 @@ export async function collectFromSeedSources({
 
     /* ---- 3) 逐篇抓取内容页并抽取真实发布日期 ---- */
     for (const link of links) {
-      const ar = await fetchWithFallback(link.url, { attempts: 2 });
+      const ar = await fetchPage(link.url, { attempts: 2 });
       if (!ar.ok) {
         tally.articles_failed += 1;
         tally.failures.push({ source: s.id, url: link.url, reason: ar.reason, message: ar.message });
@@ -1324,8 +1928,18 @@ export async function collectFromSeedSources({
         continue;
       }
       const isCets = new URL(link.url).hostname === 'www.cets.org.cn';
-      const cetsArticle = isCets ? parseCetsArticlePage(ar.raw_html || ar.html || ar.content || '', { baseUrl: link.url }) : null;
-      const articleBody = isCets ? cetsArticle?.body_text || '' : ar.content || '';
+      const rawHtml = ar.raw_html || ar.html || null;
+      const cleaned = await cleanContent({
+        rawHtml, markdown: rawHtml ? null : ar.content,
+        rawText: rawHtml ? null : ar.content, url: link.url,
+      });
+      const cetsArticle = isCets ? parseCetsArticlePage(rawHtml || ar.content || '', { baseUrl: link.url }) : null;
+      const cleanedText = String(cleaned.text || '');
+      const articleBody = cetsArticle?.body_text
+        || (cleanedText.trim().length >= MIN_ARTICLE_BODY_CHARS ? cleanedText : String(ar.content || '').trim() || cleanedText);
+      const extraction = cetsArticle?.body_text
+        ? { ...cleaned, text: articleBody, extractor: 'cets_article', extractor_version: 'cets-parser', status: 'ok', note: [cleaned.note, 'CETS 文章正文由站点解析器提取'].filter(Boolean).join('；') }
+        : { ...cleaned, text: articleBody, status: cleanedText.trim().length >= MIN_ARTICLE_BODY_CHARS ? cleaned.status : 'fallback', note: [cleaned.note, cleanedText.trim().length >= MIN_ARTICLE_BODY_CHARS ? null : 'HTML 清洗结果过短，使用抓取器返回的正文文本'].filter(Boolean).join('；') };
       // CETS must have a recognizable article body, not a successful navigation-page fetch.
       if ((isCets && !cetsArticle?.title) || String(articleBody).trim().length < MIN_ARTICLE_BODY_CHARS) {
         tally.articles_failed += 1;
@@ -1337,13 +1951,17 @@ export async function collectFromSeedSources({
         continue;
       }
       tally.articles_fetched += 1;
-      const date = extractPublishedDate(ar.raw_html || ar.html || '', { url: link.url, text: articleBody });
+      const date = extractPublishedDate(rawHtml || '', { url: link.url, text: articleBody });
       if (cetsArticle?.published_at) { date.published_at = cetsArticle.published_at; date.note = '发布日期取自全国碳市场信息网文章元数据。'; }
       if (date.published_at) tally.published_dated += 1; else tally.published_undated += 1;
-      const sourceSummary = extractMetaDescription(ar.raw_html || ar.html || '');
+      const sourceSummary = extractMetaDescription(rawHtml || '');
       const { key_points, claims } = extractClaimsAndPoints(articleBody);
       // 抽取式摘要与来源摘要分开：来源没有摘要时用抽取式，并标明 kind=extractive
       const autoSummary = sourceSummary ? null : String(articleBody).replace(/\s+/g, ' ').slice(0, 300) || null;
+      const attachments = rawHtml ? extractAttachmentLinks(rawHtml, link.url) : null;
+      const bodyAvailability = extraction.quality === 'article'
+        ? (ar.availability || 'full_text')
+        : (articleBody ? 'partial' : availabilityFromFetch(ar, articleBody));
       const up = upsertContent(
         {
           content_type: s.kinds[0],
@@ -1353,7 +1971,7 @@ export async function collectFromSeedSources({
           published_at: date.published_at,
           source_url: link.url,
           source_category: s.source_category,
-          body_availability: availabilityFromFetch(ar, articleBody),
+          body_availability: bodyAvailability,
           summary: sourceSummary,
           auto_summary: autoSummary,
           auto_summary_kind: autoSummary ? 'extractive' : null,
@@ -1361,7 +1979,10 @@ export async function collectFromSeedSources({
           claims,
           topics: ['种子来源', s.name, ...(link.date_in_url ? ['URL 日期'] : [])],
           body_snapshot: articleBody,
-          note: [date.note, `由「${s.name}」发现并抓取正文页；发现页${discoveredFrom}；首页只作来源发现，不作为文章。`]
+          raw_html: rawHtml,
+          extraction,
+          attachments,
+          note: [date.note, `由「${s.name}」发现并抓取正文页；发现页${discoveredFrom}；首页只作来源发现，不作为文章；清洗器 ${extraction.extractor} ${extraction.extractor_version}。`]
             .filter(Boolean).join('；'),
         },
         { actor, jobId }
@@ -1370,6 +1991,27 @@ export async function collectFromSeedSources({
       else if (up.action === 'duplicate') tally.unchanged += 1;
       else if (up.action === 'updated') tally.updated += 1;
       else tally.unchanged += 1;
+      if (up.action === 'inserted' || up.action === 'updated') touchedArticleIds.add(up.id);
+    }
+  }
+
+  /* ---- verify 参数真正执行（docs/74 A.2）----
+   * 只核验本次种子来源实际写入/更新的正文条目；不把首页归档或转载副本重复核验。
+   * 每日任务的内容核验由治理阶段调用 verification-svc.verifyContentItem，按 attempts/next_retry
+   * 限流；本函数的 verify=true 供显式调用与测试，不能静默忽略。 */
+  if (verify) {
+    const cfg = verifyConfig();
+    const cap = Math.max(1, Math.min(Number(cfg.max_per_run) || 20, 20));
+    for (const id of [...touchedArticleIds].slice(0, cap)) {
+      try {
+        const out = await (verifyFn || verifyContentItem)(id, { actor });
+        tally.verified += 1;
+        const key = out?.result || 'error';
+        tally.verify_results[key] = (tally.verify_results[key] || 0) + 1;
+      } catch (e) {
+        tally.verify_failed += 1;
+        tally.failures.push({ verify: id, reason: 'exception', message: e.message });
+      }
     }
   }
 

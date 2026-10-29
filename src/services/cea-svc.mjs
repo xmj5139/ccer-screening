@@ -19,8 +19,9 @@
  */
 import { all, get, run, tx, audit } from '../core/db.mjs';
 import { newId, nowIso, todayCst, round, j, uj, isDate } from '../core/util.mjs';
+import { createHash } from 'node:crypto';
 import { CEA_SOURCES, CEA_DOCUMENTS, CEA_EVENTS, CEA_DEFAULTS, CEA_SCENARIO_NOTE } from '../data/cea-sources.mjs';
-import { deriveDaily, runDailyChecks, entitySectorTags } from './cea-parse.mjs';
+import { deriveDaily, runDailyChecks, entitySectorTags, validEntityCreditCode } from './cea-parse.mjs';
 
 export const CEA_PRICE_REGIME_2026 = 'CEA_COMPOSITE_2026';
 export const CEA_INSTRUMENT = 'CEA';
@@ -1310,6 +1311,85 @@ export function closeCeaGapsByPrefixes(prefixes = [], { note = null, actor = 'sy
   return closed;
 }
 
+function normalizeExclusionUrl(raw) {
+  const s = String(raw || '').trim();
+  try {
+    const u = new URL(s);
+    u.hash = '';
+    return u.toString();
+  } catch {
+    return s;
+  }
+}
+
+/**
+ * 记录确定性规则判定的 CEA 非目标页，并把同 URL 的历史解析缺口标为
+ * mitigated（非目标，不阻塞、不自动重试）；记录保留，不删除历史。
+ */
+export function recordCeaPageExclusion({
+  url, sourceCode = null, snapshotId = null, contentHash = null, title = null,
+  rule, evidence = null, snapshotExcerpt = null, actor = 'system:cea-collect',
+} = {}) {
+  const cleanUrl = normalizeExclusionUrl(url);
+  if (!cleanUrl || !rule) return { error: '非目标页排除需要 URL 与规则', status: 400 };
+  const urlHash = createHash('sha256').update(cleanUrl).digest('hex');
+  const now = nowIso();
+  const existing = get('SELECT id FROM cea_page_exclusion WHERE url_hash=?', [urlHash]);
+  let id = existing?.id;
+  if (existing) {
+    run(
+      `UPDATE cea_page_exclusion SET url=?,source_code=COALESCE(?,source_code),snapshot_id=COALESCE(?,snapshot_id),
+         content_hash=COALESCE(?,content_hash),title=COALESCE(?,title),rule=?,evidence=COALESCE(?,evidence),
+         snapshot_excerpt=COALESCE(?,snapshot_excerpt),updated_at=? WHERE id=?`,
+      [cleanUrl, sourceCode, snapshotId, contentHash, title, rule, evidence, snapshotExcerpt, now, id]
+    );
+  } else {
+    id = newId('CEAEX');
+    run(
+      `INSERT INTO cea_page_exclusion
+        (id,url,url_hash,source_code,snapshot_id,content_hash,title,rule,evidence,snapshot_excerpt,created_at,updated_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [id, cleanUrl, urlHash, sourceCode, snapshotId, contentHash, title, rule, evidence, snapshotExcerpt, now, now]
+    );
+  }
+  const gapKeys = [
+    `cea:trade:fetch:${url}`, `cea:trade:parse:${url}`, `cea:trade:nodate:${url}`,
+    `cea:trade:fetch:${cleanUrl}`, `cea:trade:parse:${cleanUrl}`, `cea:trade:nodate:${cleanUrl}`,
+  ];
+  let gapUpdated = 0;
+  for (const key of [...new Set(gapKeys)]) {
+    const gap = get('SELECT * FROM data_gap WHERE gap_key=?', [key]);
+    if (!gap) continue;
+    const note = `｜非目标页排除：规则 ${rule}；快照 ${snapshotId || '—'}；未建行情行，停止同任务重复重试（记录保留）`;
+    run(
+      `UPDATE data_gap SET status='mitigated', classification='non_target',
+         classification_basis=?, retryable=0, blocking=0, classified_at=?,
+         description=CASE WHEN COALESCE(description,'') LIKE '%非目标页排除%' THEN description
+                          ELSE COALESCE(description,'') || ? END,
+         impact='该 URL 是明确非目标页，不是行情缺失；不建行情行，不用 0 值或估算值顶替。',
+         updated_at=? WHERE id=?`,
+      [j({ rule, url: cleanUrl, snapshot_id: snapshotId, evidence }), now, note, now, gap.id]
+    );
+    gapUpdated += 1;
+  }
+  audit({
+    actor, action: 'cea.non_target_exclusion', objectType: 'cea_page_exclusion', objectId: id,
+    detail: { url: cleanUrl, rule, snapshot_id: snapshotId, gaps_updated: gapUpdated },
+  });
+  return {
+    ok: true, id, url: cleanUrl, rule, gap_updated: gapUpdated,
+    status: gapUpdated ? 'mitigated' : 'excluded',
+    note: '已记录非目标页；不建行情行，历史同 URL 缺口已标注为非目标并停止重复重试。',
+  };
+}
+
+export function listCeaPageExclusions({ limit = 50 } = {}) {
+  return all(
+    'SELECT * FROM cea_page_exclusion ORDER BY updated_at DESC LIMIT ?',
+    [Math.max(1, Math.min(Number(limit) || 50, 500))]
+  );
+}
+
 /* ==================================================================== */
 /*  五、政策文件 / 日历 / 名录 / 意向                                    */
 /* ==================================================================== */
@@ -1794,7 +1874,11 @@ export function listCeaEntities(f = {}) {
   }
   if (f.list_year) { where.push('list_year=?'); params.push(Number(f.list_year)); }
   if (f.status) { where.push('status=?'); params.push(f.status); }
-  if (f.q) { where.push('(name LIKE ? OR credit_code LIKE ?)'); params.push(`%${f.q}%`, `%${f.q}%`); }
+  if (f.q) {
+    where.push(`(name LIKE ? OR credit_code LIKE ?
+      OR EXISTS (SELECT 1 FROM cea_entity_alias a WHERE a.entity_id=cea_entity.id AND a.alias LIKE ?))`);
+    params.push(`%${f.q}%`, `%${f.q}%`, `%${f.q}%`);
+  }
   const limit = Math.min(Number(f.limit) || 200, 1000);
   const offset = Math.max(Number(f.offset) || 0, 0);
   const clause = where.length ? 'WHERE ' + where.join(' AND ') : '';
@@ -1819,7 +1903,22 @@ export function listCeaEntities(f = {}) {
       memberships.get(m.entity_id).push(m);
     }
   }
-  for (const row of rows) row.source_memberships = memberships.get(row.id) || [];
+  for (const row of rows) {
+    row.source_memberships = memberships.get(row.id) || [];
+    const raw = String(row.raw_credit_code || '').trim();
+    const canonical = String(row.credit_code || '').trim();
+    const invalidRaw = raw && !validEntityCreditCode(raw);
+    const invalidCanonical = canonical && !validEntityCreditCode(canonical);
+    row.credit_code_valid = canonical ? validEntityCreditCode(canonical) : (raw ? false : null);
+    // 字段级非阻塞提示：原始异常值照常保留，标准代码留空，企业名称仍计入名录。
+    row.field_warnings = (invalidRaw || invalidCanonical)
+      ? [{
+        field: 'credit_code', severity: 'info', blocking: false,
+        raw_value: raw || canonical,
+        message: '原始信用代码位数/校验位异常：标准代码留空以保留原始值，不猜测补齐；企业仍按名称计入名录。',
+      }]
+      : [];
+  }
   return {
     total, limit, offset, rows,
     coverage: {
@@ -1827,6 +1926,9 @@ export function listCeaEntities(f = {}) {
       provinces: get('SELECT COUNT(DISTINCT province) AS c FROM cea_entity WHERE province IS NOT NULL')?.c || 0,
       list_years: all('SELECT DISTINCT list_year FROM cea_entity ORDER BY list_year DESC').map((r) => r.list_year),
       without_credit_code: get('SELECT COUNT(*) AS c FROM cea_entity WHERE credit_code IS NULL')?.c || 0,
+      with_invalid_credit_code: get(
+        'SELECT COUNT(*) AS c FROM cea_entity WHERE credit_code IS NULL AND raw_credit_code IS NOT NULL'
+      )?.c || 0,
     },
     note:
       '以统一社会信用代码 + 名录年度建立标识；名称变化保留来源，不合并集团旗下不同法人或分公司。' +
@@ -1835,18 +1937,248 @@ export function listCeaEntities(f = {}) {
   };
 }
 
+/**
+ * 企业档案（docs/86 第三阶段第 2 节）。
+ * 规范标识优先信用代码；无信用代码时只用“名称 + 省份 + 城市”聚合，
+ * 同名跨地区绝不合并。异常原始代码保留在 raw_credit_code，标准代码保持空白。
+ */
+export function getCeaEntityProfile(entityId) {
+  const base = get('SELECT * FROM cea_entity WHERE id=?', [String(entityId)]);
+  if (!base) return null;
+  const credit = String(base.credit_code || '').trim();
+  let group;
+  let groupKey;
+  if (credit) {
+    group = all('SELECT * FROM cea_entity WHERE credit_code=? ORDER BY list_year DESC, id', [credit]);
+    groupKey = `credit:${credit}`;
+  } else {
+    const name = String(base.name || '').trim();
+    const province = String(base.province || '').trim();
+    const city = String(base.city || '').trim();
+    group = all(
+      `SELECT * FROM cea_entity
+        WHERE name=? AND COALESCE(credit_code,'')='' AND COALESCE(province,'')=? AND COALESCE(city,'')=?
+        ORDER BY list_year DESC, id`,
+      [name, province, city]
+    );
+    groupKey = `name:${name}|${province}|${city}`;
+  }
+  if (!group.length) group = [base];
+  const ids = group.map((r) => r.id);
+  const placeholders = ids.map(() => '?').join(',');
+  const memberships = all(
+    `SELECT entity_id,source_code,sector,source_url,source_hash,snapshot_id,note,created_at,updated_at
+       FROM cea_entity_membership WHERE entity_id IN (${placeholders})
+      ORDER BY entity_id, created_at, id`,
+    ids
+  );
+  const revisions = all(
+    `SELECT entity_id,revised_at,revised_by,field,old_value,new_value,reason,source_url
+       FROM cea_entity_revision WHERE entity_id IN (${placeholders})
+      ORDER BY revised_at DESC, id DESC LIMIT 200`,
+    ids
+  );
+  let aliases = [];
+  try {
+    aliases = all(
+      `SELECT entity_id,alias,source_code,source_url,evidence_note,created_by,created_at
+         FROM cea_entity_alias WHERE entity_id IN (${placeholders})
+        ORDER BY created_at, id`,
+      ids
+    );
+  } catch { aliases = []; }
+
+  const aliasMap = new Map();
+  for (const a of aliases) {
+    const key = `${a.alias}|${a.source_code || ''}`;
+    if (!aliasMap.has(key)) aliasMap.set(key, { ...a, kind: 'declared' });
+  }
+  // 历年名称变化也是来源明确写出的历史名称；不凭相似度推断别名。
+  for (const r of group) {
+    const name = String(r.name || '').trim();
+    if (!name || name === base.name) continue;
+    const key = `${name}|`;
+    if (!aliasMap.has(key)) {
+      aliasMap.set(key, {
+        alias: name, kind: 'historical_name', source_code: r.source_code || null,
+        source_url: r.source_url || null, evidence_note: `名录 ${r.list_year} 年保存的名称`,
+      });
+    }
+  }
+  for (const rev of revisions.filter((x) => x.field === 'name' && x.new_value)) {
+    const key = `${rev.new_value}|`;
+    if (!aliasMap.has(key)) {
+      aliasMap.set(key, {
+        alias: rev.new_value, kind: 'historical_name', source_code: null,
+        source_url: rev.source_url || null, evidence_note: `修订记录：${rev.reason || '名称变化'}`,
+      });
+    }
+  }
+
+  const years = group.map((r) => ({
+    entity_id: r.id, list_year: r.list_year, name: r.name, status: r.status,
+    province: r.province, city: r.city, sector: r.sector,
+    credit_code: r.credit_code || null, raw_credit_code: r.raw_credit_code || null,
+    credit_code_valid: r.credit_code_valid,
+    source_code: r.source_code || null, source_url: r.source_url || null,
+    data_as_of: r.data_as_of || null, verify_status: r.verify_status,
+  })).sort((a, b) => Number(b.list_year) - Number(a.list_year));
+
+  const membershipByYear = new Map();
+  for (const m of memberships) {
+    const y = group.find((r) => r.id === m.entity_id)?.list_year;
+    if (!membershipByYear.has(y)) membershipByYear.set(y, []);
+    membershipByYear.get(y).push({
+      source_code: m.source_code || null, sector: m.sector || null,
+      source_url: m.source_url || null, note: m.note || null, snapshot_id: m.snapshot_id || null,
+    });
+  }
+  const industryRelations = [...membershipByYear.entries()]
+    .filter(([year]) => year !== undefined && year !== null)
+    .sort((a, b) => Number(b[0]) - Number(a[0]))
+    .map(([year, items]) => ({
+      list_year: year,
+      sectors: [...new Set(items.map((x) => x.sector).filter(Boolean))],
+      sources: items,
+    }));
+
+  const sourceMap = new Map();
+  for (const y of years) {
+    if (y.source_code || y.source_url) {
+      const key = `${y.source_code || ''}|${y.source_url || ''}`;
+      sourceMap.set(key, {
+        source_code: y.source_code, source_url: y.source_url,
+        list_year: y.list_year, sector: y.sector, as_of: y.data_as_of,
+        note: '名录主体来源',
+      });
+    }
+  }
+  for (const m of memberships) {
+    if (!m.source_code && !m.source_url) continue;
+    const key = `${m.source_code || ''}|${m.source_url || ''}`;
+    if (!sourceMap.has(key)) {
+      sourceMap.set(key, {
+        source_code: m.source_code || null, source_url: m.source_url || null,
+        list_year: group.find((r) => r.id === m.entity_id)?.list_year ?? null,
+        sector: m.sector || null, note: m.note || null,
+      });
+    }
+  }
+
+  // 关联公开资料只做“正文/标题提及”，不宣称官方关系。
+  let mentions = [];
+  try {
+    const like = `%${String(base.name || '').replace(/[\\%_]/g, (m) => `\\${m}`)}%`;
+    mentions = all(
+      `SELECT id,title,publisher,published_at,source_url FROM content_item
+        WHERE is_demo=0 AND duplicate_of IS NULL AND record_kind='article'
+          AND (title LIKE ? ESCAPE '\\' OR body_snapshot LIKE ? ESCAPE '\\')
+        ORDER BY published_at DESC LIMIT 5`,
+      [like, like]
+    ).map((r) => ({ ...r, relation: '正文/标题提及，非官方关系' }));
+  } catch { mentions = []; }
+
+  return {
+    ok: true,
+    id: base.id,
+    entity_id: base.id,
+    profile_id: groupKey,
+    canonical_id: groupKey,
+    canonical_entity_key: base.entity_key,
+    entity: {
+      id: base.id, name: base.name, credit_code: base.credit_code || null,
+      raw_credit_code: base.raw_credit_code || null, credit_code_valid: base.credit_code_valid,
+      province: base.province, city: base.city, sector: base.sector,
+      list_year: base.list_year, status: base.status, verify_status: base.verify_status,
+      source_url: base.source_url, data_as_of: base.data_as_of,
+      note: base.note || null,
+    },
+    identity_basis: credit ? '统一社会信用代码' : '名称 + 省份 + 城市（无信用代码，不跨地区合并）',
+    alias_evidence_note: '别名/历史名称只来自历年名录行或修订记录；不按名称相似度自动合并。',
+    aliases: [...aliasMap.values()],
+    years,
+    year_relations: years,
+    industry_relations: industryRelations,
+    industry_memberships: industryRelations,
+    sources: [...sourceMap.values()],
+    public_sources: [...sourceMap.values()],
+    revisions,
+    history: revisions,
+    mentions,
+    emissions: null,
+    emission_note: '本档案不提供企业实际排放量，不用国际估算或名录数量推算。',
+    note: '同一信用代码跨年度汇总；无代码时仅同省同市同名聚合。名录身份不等于持仓、买家身份或履约义务。',
+  };
+}
+
+/** 管理员补充来源明确的别名；写审计并保留原始来源。 */
+export function addCeaEntityAlias(user, {
+  entityId, alias, sourceCode = null, sourceUrl = null, evidenceNote = null,
+} = {}) {
+  if (String(user?.role || '') !== 'admin') return { error: '仅管理员可维护企业别名', status: 403 };
+  const entity = get('SELECT id FROM cea_entity WHERE id=?', [String(entityId)]);
+  if (!entity) return { error: '企业不存在', status: 404 };
+  const text = String(alias || '').trim().slice(0, 200);
+  if (!text) return { error: '别名为空', status: 400 };
+  const url = sourceUrl ? String(sourceUrl).trim() : null;
+  if (url && !/^https?:\/\//i.test(url)) return { error: '来源链接只允许 http(s)', status: 400 };
+  const now = nowIso();
+  try {
+    run(
+      `INSERT OR IGNORE INTO cea_entity_alias
+         (id,entity_id,alias,source_code,source_url,evidence_note,created_by,created_at)
+       VALUES (?,?,?,?,?,?,?,?)`,
+      [newId('CEAALIAS'), String(entityId), text, sourceCode || null, url,
+        evidenceNote ? String(evidenceNote).slice(0, 500) : null, user?.name || 'admin', now]
+    );
+  } catch (e) {
+    return { error: `别名写入失败：${e.message}`, status: 500 };
+  }
+  audit({
+    actor: user?.name || 'admin', action: 'cea_entity.alias_add',
+    objectType: 'cea_entity', objectId: String(entityId),
+    detail: { alias: text, source_code: sourceCode || null, source_url: url },
+  });
+  return { ok: true, entity_id: String(entityId), alias: text };
+}
+
 export function upsertCeaEntity(patch = {}, { actor = 'system:cea-collect' } = {}) {
   const name = String(patch.name || '').trim();
   if (!name) return { error: '缺少企业名称', status: 400 };
   const listYear = Number(patch.list_year);
   if (!Number.isInteger(listYear)) return { error: '缺少名录年度 list_year', status: 400 };
-  const creditCode = patch.credit_code ? String(patch.credit_code).trim().toUpperCase() : null;
-  const entityKey = creditCode || `name:${name}`;
+  const suppliedCreditCode = patch.credit_code ? String(patch.credit_code).trim().toUpperCase() : null;
+  // 异常代码不进入标准 credit_code（留空），原始值只进 raw_credit_code；
+  // 企业名称仍照常入名录，字段级异常不升级为整条缺失。
+  const creditCode = suppliedCreditCode && validEntityCreditCode(suppliedCreditCode)
+    ? suppliedCreditCode : null;
+  const rawCreditCode = String(patch.raw_credit_code || suppliedCreditCode || '').trim().toUpperCase() || null;
+  const creditCodeValid = creditCode ? 1 : (rawCreditCode ? 0 : null);
+  // 无信用代码时把省份/城市纳入稳定键，避免“同名跨地区”被 UNIQUE 误合并。
+  const entityKey = creditCode
+    || `name:${name}|${String(patch.province || '').trim()}|${String(patch.city || '').trim()}`;
   const now = nowIso();
   const sourceCode = String(patch.source_code || '').trim() || null;
   let ex = get('SELECT * FROM cea_entity WHERE entity_key=? AND list_year=?', [entityKey, listYear]);
+  // 兼容第三阶段前的无代码旧键（name:<名称>）：只有同省同市才命中，跨地区仍不合并。
+  if (!ex && !creditCode) {
+    ex = get(
+      `SELECT * FROM cea_entity
+        WHERE entity_key=? AND list_year=?
+          AND COALESCE(province,'')=? AND COALESCE(city,'')=?`,
+      [`name:${name}`, listYear, String(patch.province || '').trim(), String(patch.city || '').trim()]
+    );
+  }
   // 同一原始名录的重采可能暂时识别不出信用代码；不能新增同名重复行，也不抹去旧代码。
-  if (!ex && !creditCode && sourceCode) ex = get('SELECT * FROM cea_entity WHERE name=? AND list_year=? AND source_code=?', [name, listYear, sourceCode]);
+  if (!ex && !creditCode && sourceCode) {
+    // 重采只允许在同一“名称+年度+来源+省份+城市”内命中；不能把同名跨地区行合并。
+    ex = get(
+      `SELECT * FROM cea_entity
+        WHERE name=? AND list_year=? AND source_code=?
+          AND COALESCE(province,'')=? AND COALESCE(city,'')=?`,
+      [name, listYear, sourceCode, String(patch.province || '').trim(), String(patch.city || '').trim()]
+    );
+  }
   const source = sourceCode ? get('SELECT id FROM cea_source WHERE code=?', [sourceCode]) : null;
   if (ex) {
     // 有来源输入：本来源的行业成员关系独立保留，其他来源不删除；主体 sector 取全部成员关系并集。
@@ -1880,11 +2212,13 @@ export function upsertCeaEntity(patch = {}, { actor = 'system:cea-collect' } = {
     }
     run(
       `UPDATE cea_entity SET name=?,province=?,city=?,sector=?,status=?,
+         raw_credit_code=COALESCE(?,raw_credit_code),credit_code_valid=COALESCE(?,credit_code_valid),
          source_id=COALESCE(?,source_id),source_url=COALESCE(?,source_url),
          source_code=COALESCE(?,source_code),snapshot_id=COALESCE(?,snapshot_id),source_hash=COALESCE(?,source_hash),
          data_as_of=COALESCE(?,data_as_of),note=COALESCE(?,note),updated_at=? WHERE id=?`,
       [
         next.name, next.province, next.city, next.sector, next.status,
+        rawCreditCode, creditCodeValid,
         source?.id ?? null, patch.source_url ?? null, sourceCode, patch.snapshot_id ?? null,
         patch.source_hash ?? null, patch.data_as_of ?? null, patch.note ?? null, now, ex.id,
       ]
@@ -1895,11 +2229,13 @@ export function upsertCeaEntity(patch = {}, { actor = 'system:cea-collect' } = {
   const initialSectors = entityMembershipSectors(patch);
   const initialSector = initialSectors.length ? initialSectors.join('、') : (patch.sector || null);
   run(
-    `INSERT INTO cea_entity (id,entity_key,name,credit_code,province,city,sector,list_year,status,source_id,
+    `INSERT INTO cea_entity (id,entity_key,name,credit_code,raw_credit_code,credit_code_valid,
+       province,city,sector,list_year,status,source_id,
        source_url,source_code,snapshot_id,source_hash,data_as_of,verify_status,note,created_at,updated_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'unverified',?,?,?)`,
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'unverified',?,?,?)`,
     [
-      id, entityKey, name, creditCode, patch.province ?? null, patch.city ?? null, initialSector,
+      id, entityKey, name, creditCode, rawCreditCode, creditCodeValid,
+      patch.province ?? null, patch.city ?? null, initialSector,
       listYear, patch.status || 'existing', source?.id || null, patch.source_url || null,
       sourceCode, patch.snapshot_id || null, patch.source_hash || null,
       patch.data_as_of || null, patch.note || null, now, now,

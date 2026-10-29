@@ -837,6 +837,10 @@ function detailHtml(data, state) {
         ? `<p class="region-detail-hint">本平台尚未收录该省该名录年度的企业；灰色斜纹表示未收录，不补 0，也不代表该省没有重点排放单位。</p>`
         : ''}
       <dl class="region-kv-list">${detailRows(data, region, metric)}</dl>
+      ${(dir.entities || []).length ? `<div class="region-samples"><b>已收录企业（可进入档案）</b>
+        <ul>${dir.entities.slice(0, 8).map((e) => `<li><a class="link" href="#/cea?tab=entities&entity=${encodeURIComponent(e.id)}">${esc(e.name)}</a>
+          <span class="muted">${esc(e.sector || '行业未标注')}${e.credit_code ? `｜${esc(e.credit_code)}` : '｜代码未披露'}</span></li>`).join('')}</ul>
+        <p class="hint">${esc(dir.entities_note || '仅列已收录名录，不是全省完整名单。')}</p></div>` : ''}
       ${directorySourcesHtml(dir)}
       <div class="region-detail-links">
         <a class="link" href="${esc(entityListHref(region))}">在 CEA 企业名录中查看该省</a>

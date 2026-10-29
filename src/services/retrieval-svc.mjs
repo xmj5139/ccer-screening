@@ -190,6 +190,22 @@ export const RETRIEVAL_SOURCES = [
     detail(r) { return [r.sub, r.org].filter(Boolean).join('｜'); },
     drill: () => '#/measure?tab=public',
   },
+  {
+    key: 'entity', entity_type: 'cea_entity', label: 'CEA 重点排放单位名录',
+    sql: `SELECT id, name AS title, credit_code AS sub, sector AS org, data_as_of AS date,
+                 source_url AS url, NULL AS summary, NULL AS body, province, city, list_year, verify_status
+          FROM cea_entity`,
+    title_col: 'name', q_cols: ['name', 'credit_code', 'province', 'city', 'sector'],
+    date_col: 'data_as_of',
+    detail(r) {
+      return [
+        r.province, r.city, r.org,
+        r.list_year ? `${r.list_year} 年名录` : null,
+        r.verify_status ? `核验状态 ${r.verify_status}` : null,
+      ].filter(Boolean).join('｜');
+    },
+    drill: (r) => `#/cea?tab=entities&q=${encodeURIComponent(r.title || '')}`,
+  },
 ];
 
 const STOP_WORDS = new Set([
@@ -387,6 +403,7 @@ export function retrieveEvidence(question, { limit = MAX_EVIDENCE, sources = nul
   const picked = sources ? RETRIEVAL_SOURCES.filter((s) => sources.includes(s.key)) : RETRIEVAL_SOURCES;
   const out = [];
   const perSource = new Map();
+  const sourceErrors = [];
 
   for (const src of picked) {
     const timeSensitive = TIME_SENSITIVE_SOURCES.has(src.key);
@@ -418,8 +435,10 @@ export function retrieveEvidence(question, { limit = MAX_EVIDENCE, sources = nul
         `${src.sql}${src.sql.includes('WHERE') ? ' AND' : ' WHERE'} (${where.join(' OR ')})${order} LIMIT 40`,
         params
       );
-    } catch {
+    } catch (e) {
       rows = [];
+      // 表/字段不可用不是「没有公开信息」：如实记录来源错误，供问答避免误判。
+      sourceErrors.push({ source: src.key, label: src.label, message: String(e.message || e).slice(0, 200) });
     }
     // 行情类问题：额外把**最新**的行情记录作为候选（保证「最新价」能拿到真实最新行），
     // 其时效是否可用于回答由下面统一的时效校验判定。
@@ -518,9 +537,12 @@ export function retrieveEvidence(question, { limit = MAX_EVIDENCE, sources = nul
   const weak = ranked.length === 0 || strong.length === 0 || yearMismatch || dateMismatch || staleLatest || missingQuote;
 
   const reason = ranked.length === 0
-    ? (dates.length
-      ? `库内没有 ${dates.join('/')} 的匹配记录（行情类问题不得用其它日期的数据回答）`
-      : '库内没有可检索的匹配记录')
+    ? (sourceErrors.length
+      ? `库内检索有 ${sourceErrors.length} 个来源执行失败（${sourceErrors.map((x) => x.label).join('、')}），` +
+        '不能据此判断没有公开信息；可稍后重试或查看对应数据源状态'
+      : dates.length
+        ? `库内没有 ${dates.join('/')} 的匹配记录（行情类问题不得用其它日期的数据回答）`
+        : '库内没有可检索的匹配记录')
     : strong.length === 0
       ? '库内仅有弱相关记录（未达到可用证据阈值）'
       : yearMismatch
@@ -549,6 +571,7 @@ export function retrieveEvidence(question, { limit = MAX_EVIDENCE, sources = nul
     dates,
     newest_market_date: newestMarketDate,
     per_source: Object.fromEntries(perSource),
+    source_errors: sourceErrors,
   };
 }
 

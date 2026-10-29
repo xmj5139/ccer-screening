@@ -22,6 +22,8 @@ import * as summarySvc from './summary-svc.mjs';
 import * as chatSvc from './chat-svc.mjs';
 import { listOfficialDomains, upsertOfficialDomain, seedOfficialDomains, sourceDisplay } from './source-display-svc.mjs';
 import { syncStatus } from './collect-svc.mjs';
+import * as gapTriage from './gap-triage-svc.mjs';
+import * as ingestSummary from './ingest-summary-svc.mjs';
 
 /* ==================================================================== */
 /*  一、可编辑实体与字段白名单                                           */
@@ -503,16 +505,21 @@ export function maintenanceOverview(user, { gapStatus = 'all' } = {}) {
   const denied = requireAdmin(user);
   if (denied) return denied;
   const sync = syncStatus();
+  const triageAll = gapTriage.triageGaps({ status: 'all', limit: 300 });
+  const triageById = new Map(triageAll.items.map((g) => [g.id, g]));
   const gaps = adminSvc.listGaps({ status: gapStatus }).map((g) => {
     const decorated = decorateGap(g);
+    const t = triageById.get(g.id);
     return {
       ...decorated,
+      triage: t?.triage || gapTriage.classifyGap(g),
+      auto_settled: t?.auto_settled || null,
       // 缺口原因与**自动处理方式**分列：编辑说明不等于修复原始数据
       reason: decorated.description || decorated.impact || null,
-      raw_data_fix: '缺口只能通过重新采集/补证结清；后台编辑缺口说明不会改变原始数据。',
+      raw_data_fix: '缺口只能通过重新采集/补证/受控重解析结清；后台编辑说明不会改变原始数据。',
     };
   });
-  const open = gaps.filter((g) => g.status !== 'closed' && g.status !== 'resolved');
+  const open = gaps.filter((g) => g.status === 'open');
   return {
     run: {
       data_as_of: sync.data_as_of || null,
@@ -526,9 +533,15 @@ export function maintenanceOverview(user, { gapStatus = 'all' } = {}) {
       total: gaps.length,
       open: open.length,
       items: gaps,
-      note: '缺口是自动运行状态：由每日自动任务重试与补全；这里可查看原因（gap reason）并发起有界重试。',
+      by_category: triageAll.by_category,
+      categories: triageAll.categories,
+      stage_categories: triageAll.stage_categories,
+      optional_field_anomalies: triageAll.optional_field_anomalies,
+      non_target_exclusions: triageAll.non_target_exclusions,
+      note: triageAll.note,
     },
     summaries: summarySvc.summaryStatus(),
+    ingest_summary: ingestSummary.ingestQueueStatus({ limit: 15 }),
     chat: chatSvc.chatStatus({ limit: 20 }),
     edit_types: EDITABLE_KEYS.map((k) => ({ key: k, label: EDITABLE_ENTITIES[k].label })),
     retry_targets: RETRY_TARGETS,
@@ -575,7 +588,13 @@ export async function runRetry(user, { target, limit = 5, actorNote = null } = {
   audit({ actor, actorRole: user.role, action: 'maintenance.retry', objectType: 'collect', objectId: t.key, detail: { limit: n, note: actorNote } });
 
   if (t.key === 'summaries') {
-    const out = await summarySvc.runSummaryBatch({ limit: n, actor, budgetMs: 60_000 });
+    const out = await summarySvc.runSummaryBatchExclusive({ limit: n, actor, budgetMs: 60_000 });
+    if (out?.busy) {
+      return {
+        ok: false, target: t.key, label: t.label, ...out,
+        message: '已有摘要批次在执行中（全局/跨进程单并发），本次未执行。',
+      };
+    }
     return {
       ok: out.generated > 0 || !out.model_configured ? !!out.model_configured : true,
       target: t.key, label: t.label, ...out,
@@ -606,17 +625,22 @@ export async function runRetry(user, { target, limit = 5, actorNote = null } = {
 export function gapReasons(user, { status = 'all' } = {}) {
   const denied = requireAdmin(user);
   if (denied) return denied;
+  const triage = gapTriage.triageGaps({ status, limit: 300, persist: false });
   return {
-    gaps: adminSvc.listGaps({ status }).map((g) => {
-      const d = decorateGap(g);
-      return {
-        gap_key: d.gap_key, dataset: d.dataset, severity: d.severity, status: d.status,
-        title: d.title, reason: d.description || null, impact: d.impact || null,
-        auto_action: d.auto_action || null, detected_at: d.detected_at, updated_at: d.updated_at,
-        raw_data_fix: '结清缺口只能靠重新采集/补证；编辑缺口说明不会修复原始数据。',
-      };
-    }),
-    note: '缺口原因来自台账与实时归档状态推导；本接口仅管理员可访问。',
+    gaps: triage.items.map((d) => ({
+      ...d,
+      gap_key: d.gap_key, dataset: d.dataset, severity: d.severity, status: d.status,
+      title: d.title, reason: d.description || null, impact: d.impact || null,
+      auto_action: d.triage.auto_action || d.auto_action || null, detected_at: d.detected_at, updated_at: d.updated_at,
+      triage: d.triage,
+      raw_data_fix: '结清缺口只能靠重新采集/补证/受控重解析；编辑缺口说明不会修复原始数据。',
+    })),
+    by_category: triage.by_category,
+    categories: triage.categories,
+    stage_categories: triage.stage_categories,
+    optional_field_anomalies: triage.optional_field_anomalies,
+    non_target_exclusions: triage.non_target_exclusions,
+    note: triage.note,
   };
 }
 

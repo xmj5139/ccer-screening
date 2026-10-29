@@ -864,6 +864,25 @@ export async function startServer({ port = PORT, host = HOST } = {}) {
         import('./services/daily-scheduler.mjs').then((m) => m.startDailyScheduler())
           .catch((e) => console.error(`  每日调度未启动：${e.message}`));
       }
+      // 入库摘要 worker 与 06:30 每日调度相互独立：默认随 v2 服务启动，
+      // 可显式用 CCER_INGEST_SUMMARY_WORKER=0 停用；生产只读库不启动写入型 worker。
+      if (v2.ok && !v2.production_db) {
+        import('./services/ingest-summary-svc.mjs').then(async (m) => {
+          const st = m.startIngestSummaryWorker();
+          if (st.started) {
+            console.log(`  入库摘要队列：已启动（${st.config.interval_ms / 1000} 秒周期，单批 ≤${st.config.batch_size} 条 / ${st.config.budget_ms / 1000} 秒）`);
+            try {
+              const filled = m.enqueueMissedContentSummaries({ limit: 20, actor: 'system:startup-backfill', source: 'startup_backfill' });
+              if (filled.queued) console.log(`  入库摘要队列：启动兜底补入 ${filled.queued} 条漏队内容`);
+            } catch { /* 兜底失败不影响服务，队列状态接口可见 */ }
+          } else {
+            console.log(`  入库摘要队列：未启动（${st.reason}）`);
+          }
+        }).catch((e) => console.error(`  入库摘要队列未启动：${e.message}`));
+      }
+      server.on('close', () => {
+        import('./services/ingest-summary-svc.mjs').then((m) => m.stopIngestSummaryWorker({ reason: 'server_close' })).catch(() => {});
+      });
       console.log('  ─────────────────────────────────────────────');
       console.log(process.env.CCER_ENABLE_V2 === '1'
         ? '  提示：公开资料自动采集与核验；减排量为规模粗估。'

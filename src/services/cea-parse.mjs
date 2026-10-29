@@ -605,6 +605,100 @@ export function parseCeaDailyReport(raw, opts = {}) {
   };
 }
 
+/**
+ * 在解析行情前判断页面是否明确为非目标页（企业基本信息、招聘、导航等）。
+ *
+ * 关键纪律：
+ *   - 只看标题/主内容，不因页脚或导航里出现“基本信息”误伤真正日报；
+ *   - 真正日报只要标题/主内容出现日报语义和行情字段，就不判非目标；
+ *   - 未知、空正文、访问失败都不判非目标，由调用方保留缺口。
+ *
+ * @returns {{non_target:boolean, rule:string|null, title:string, evidence:string,
+ *            main_excerpt:string, reason:string}}
+ */
+export function detectCeaNonTargetPage(raw, { url = '' } = {}) {
+  const source = String(raw || '');
+  const title = (() => {
+    if (!looksLikeHtml(source)) return '';
+    const t = source.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]
+      || source.match(/<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i)?.[1]
+      || source.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i)?.[1]
+      || '';
+    return htmlToText(t).replace(/\s+/g, ' ').trim();
+  })();
+  let mainHtml = '';
+  if (looksLikeHtml(source)) {
+    const article = source.match(/<(main|article)\b[^>]*>([\s\S]*?)<\/\1>/i);
+    if (article) mainHtml = article[2];
+    else {
+      mainHtml = source
+        .replace(/<(script|style|noscript|nav|header|footer|aside)\b[^>]*>[\s\S]*?<\/\1>/gi, ' ');
+    }
+  } else {
+    mainHtml = source;
+  }
+  const main = htmlToText(mainHtml).replace(/\s+/g, ' ').trim();
+  const top = main.slice(0, 1200);
+  const heading = htmlToText(source.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i)?.[1] || '').replace(/\s+/g, ' ').trim();
+  const titleLike = [title, heading].filter(Boolean).join(' ｜ ').trim();
+  const excerpt = main.slice(0, 240);
+  const compactMain = main.replace(/\s+/g, '');
+  const accessError = /访问过于频繁|Access\s*Denied|拒绝访问|请稍后重试|验证码|人机验证|403\s*Forbidden|404\s*Not\s*Found|页面不存在|服务异常|系统繁忙/i.test(top);
+
+  // 访问失败/限流页即使保留了原“基本信息”标题，也不是确定性排除证据；
+  // 只有标题而没有可用主内容同样不能结清历史缺口。
+  if (accessError || compactMain.length === 0) {
+    return {
+      non_target: false, rule: null, title: titleLike || null,
+      evidence: accessError ? '主内容是访问失败/限流提示，不能据标题判定非目标页' : '只有标题、主内容为空，不能判定非目标页',
+      main_excerpt: excerpt, reason: accessError ? 'access_error_page' : 'empty_main_content',
+    };
+  }
+
+  const reportSignal = /每日行情|行情日报|日行情|每日成交|交易行情|成交情况|碳排放权交易市场|全国碳排放权交易市场配额|CEA25|开盘价|收盘价|最高价|最低价|成交量|成交额|挂牌协议|大宗协议|单向竞价/.test(`${titleLike} ${top}`);
+  const tradeFieldSignal = /(开盘价|收盘价|最高价|最低价|成交量|成交额|挂牌协议|大宗协议|单向竞价)/.test(`${titleLike} ${top}`)
+    && /\d/.test(top);
+  if (reportSignal && tradeFieldSignal) {
+    return {
+      non_target: false, rule: null, title: titleLike || null,
+      evidence: '标题/主内容出现日报语义与行情字段，不因导航或页脚中的一般词误判',
+      main_excerpt: excerpt, reason: 'target_daily_report',
+    };
+  }
+
+  const titleRules = [
+    ['entity_basic_info', /企业(?:单位)?基本信息|单位基本信息|企业信息查询|重点排放单位基本信息|基本信息/],
+    ['recruitment', /招聘|招贤纳士|人才招聘|校园招聘|社会招聘/],
+    ['navigation', /网站地图|网站导航|联系我们|联系方式|关于我们|^首页$|^导航$/],
+  ];
+  for (const [rule, re] of titleRules) {
+    if (re.test(titleLike)) {
+      const hit = titleLike.match(re)?.[0] || rule;
+      return {
+        non_target: true, rule: `title_${rule}`, title: titleLike,
+        evidence: `标题明确为「${hit}」，且未见 CEA 行情字段`, main_excerpt: excerpt,
+        reason: '标题表明是企业基本信息/招聘/导航等非目标页',
+      };
+    }
+  }
+
+  const mainRe = /企业基本信息|单位基本信息|人才招聘|招聘信息|网站地图|网站导航|联系我们/;
+  if (mainRe.test(top) && !reportSignal) {
+    const hit = top.match(mainRe)?.[0] || '';
+    return {
+      non_target: true, rule: 'main_non_target_content', title: titleLike || null,
+      evidence: `主内容出现「${hit}」，且无 CEA 日报/行情字段`, main_excerpt: excerpt,
+      reason: '主内容明确属于企业基本信息/招聘/导航等非目标页',
+    };
+  }
+
+  return {
+    non_target: false, rule: null, title: titleLike || null,
+    evidence: '未发现明确的非目标页标题/主内容规则', main_excerpt: excerpt,
+    reason: 'unknown_target',
+  };
+}
+
 function looksLikeHtml(s) {
   return /<\s*(html|body|div|table|tr|td|p|span|br)\b/i.test(String(s || ''));
 }

@@ -10,6 +10,7 @@ import {
   num, pct, esc, shortDate, chip, drawer, renderKvRows, toast,} from '../ui.js';
 import { sourceBlock, sourceLinkBlock, summaryBlock, summaryCoverageHint, rangeSummaryBar, chatPanel, bindChatPanel } from '../platform.js';
 import { mountRegionMap, mapQueryFromRoute } from './region-map.js';
+import { selectOptionsHtml } from '../form-selects.js';
 
 const RANGES = [
   { value: '30d', label: '近 30 天' },
@@ -52,14 +53,10 @@ export async function renderOverview(root) {
       <label class="fld"><span>时间范围</span><select data-f="range">
         ${RANGES.map((r) => `<option value="${r.value}" ${f.range === r.value ? 'selected' : ''}>${r.label}</option>`).join('')}
       </select></label>
-      <label class="fld"><span>领域</span><select data-f="domain"><option value="">全部</option>
-        ${(opts.domains || []).map((d) => `<option value="${esc(d)}" ${f.domain === d ? 'selected' : ''}>${esc(d)}</option>`).join('')}</select></label>
-      <label class="fld"><span>方法学</span><select data-f="methodology_id"><option value="">全部</option>
-        ${(opts.methodologies || []).map((m) => `<option value="${esc(m.methodology_id)}" ${f.methodology_id === m.methodology_id ? 'selected' : ''}>${esc(m.methodology_id)}</option>`).join('')}</select></label>
-      <label class="fld"><span>省份</span><select data-f="province"><option value="">全部</option>
-        ${(opts.provinces || []).map((p) => `<option value="${esc(p)}" ${f.province === p ? 'selected' : ''}>${esc(p)}</option>`).join('')}</select></label>
-      <label class="fld"><span>阶段</span><select data-f="stage"><option value="">全部</option>
-        ${(opts.stages || []).map((s) => `<option value="${s.key}" ${f.stage === s.key ? 'selected' : ''}>${esc(s.label)}</option>`).join('')}</select></label>
+      <label class="fld"><span>领域</span><select data-f="domain">${selectOptionsHtml(opts.domains || [], f.domain, { allLabel: '全部领域' })}</select></label>
+      <label class="fld"><span>方法学</span><select data-f="methodology_id">${selectOptionsHtml((opts.methodologies || []).map((m) => ({ value: m.methodology_id, label: m.methodology_id })), f.methodology_id, { allLabel: '全部方法学' })}</select></label>
+      <label class="fld"><span>省份</span><select data-f="province">${selectOptionsHtml(opts.provinces || [], f.province, { allLabel: '全部省份' })}</select></label>
+      <label class="fld"><span>阶段</span><select data-f="stage">${selectOptionsHtml(opts.stages || [], f.stage, { allLabel: '全部阶段' })}</select></label>
       <span class="fld-actions"><button class="btn btn-sm" data-reset>重置</button></span>
     </div>`;
 

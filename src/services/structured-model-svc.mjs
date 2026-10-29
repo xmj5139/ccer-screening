@@ -120,10 +120,10 @@ export async function callStructuredModel({
   provider, prompt, systemPrompt, requiredFields = {}, purpose = 'structured',
   maxTokens = 1200, timeoutMs = 45000, thinking = 'disabled', reasoningEffort = null,
   actor = 'system:structured', objectType = 'model', objectId = null, repairHint = null,
-  messages = null,
+  messages = null, maxRetries = null,
 } = {}) {
   const cfg = capabilityConfig('json');
-  const maxRetry = Math.max(0, Math.min(Number(cfg.max_retry ?? 1), 1)); // 硬上限 1 次
+  const maxRetry = Math.max(0, Math.min(Number(maxRetries ?? cfg.max_retry ?? 1), 1)); // 硬上限 1 次
   const budgetCap = Math.max(Number(maxTokens) || 1200, Number(cfg.max_output_tokens) || 2200);
   const jsonMode = isDeepSeekEndpoint(provider);
   let attempts = 0;

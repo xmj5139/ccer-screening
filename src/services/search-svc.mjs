@@ -55,6 +55,8 @@ export const SEARCH_KINDS = {
       count_field: 'count',
       freshness_field: 'freshness',
       freshness_value: 'noLimit',
+      // 博查 freshness 支持 noLimit/oneDay/... 以及精确区间 YYYY-MM-DD..YYYY-MM-DD。
+      freshness_range: true,
       summary_field: 'summary',
       raw_content_field: null,
       extra: {},
@@ -477,9 +479,17 @@ export function buildSearchRequest(provider, query, opts = {}) {
   }
   if (paramMap.start_field && opts.start_date) set(paramMap.start_field, opts.start_date);
   if (paramMap.end_field && opts.end_date) set(paramMap.end_field, opts.end_date);
-  // freshness：显式传入优先；否则按「最近 N 天」窗口推导（供应商不支持时映射里不会有该字段）
+  // 分页为可选能力：只有连接显式声明 page_field / page_size_field 才发送，
+  // 不向未声明的供应商塞未知参数。历史补采据此判断「能否翻页」。
+  if (paramMap.page_field && opts.page !== undefined && opts.page !== null) set(paramMap.page_field, opts.page);
+  if (paramMap.page_size_field && opts.page_size) set(paramMap.page_size_field, opts.page_size);
+  // freshness：显式传入优先；博查等声明 freshness_range 的供应商使用精确区间
+  // YYYY-MM-DD..YYYY-MM-DD，确保历史补采的日期条件真正发送，而不是退化为 noLimit。
   if (paramMap.freshness_field) {
-    const fv = opts.freshness
+    const supportsRange = paramMap.freshness_range === true || provider.provider_kind === 'bocha';
+    const exactRange = supportsRange && opts.start_date && opts.end_date
+      ? `${opts.start_date}..${opts.end_date}` : null;
+    const fv = opts.freshness || exactRange
       || (opts.window_days !== undefined && opts.window_days !== null
         ? freshnessForWindow(opts.window_days)
         : (opts.start_date ? 'noLimit' : paramMap.freshness_value));

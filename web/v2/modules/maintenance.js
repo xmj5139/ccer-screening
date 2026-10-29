@@ -18,15 +18,24 @@ import {
   card, table, loading, emptyState, errorState, noteBlock, esc, shortDate, dateTime, chip,
   kv, toast, num, truncate, drawer,
 } from '../ui.js';
+import {
+  datalistHtml, editFieldControl, fallbackFormOptions, loadFormOptions,
+} from '../form-selects.js';
 
 let summaryPoll = null;
 
-export async function renderMaintenance(body) {
+export async function renderMaintenance(body, q = {}) {
   stopSummaryPoll();
   body.innerHTML = loading('正在加载运行与内容维护…');
   let d;
+  let adminOptions;
   try {
-    d = await api('/api/v2/admin/maintenance/overview');
+    const [overview, formOptions] = await Promise.all([
+      api('/api/v2/admin/maintenance/overview'),
+      loadFormOptions(api).catch(() => fallbackFormOptions()),
+    ]);
+    d = overview;
+    adminOptions = formOptions.admin;
   } catch (e) {
     body.innerHTML = errorState(e);
     return;
@@ -34,6 +43,7 @@ export async function renderMaintenance(body) {
   const run = d.run || {};
   const gaps = d.gaps || { items: [] };
   const sum = d.summaries || {};
+  const ingest = d.ingest_summary || {};
   const chat = d.chat || {};
 
   body.innerHTML = `
@@ -69,20 +79,75 @@ export async function renderMaintenance(body) {
 
   ${card({
     title: '数据缺口与原因',
-    subtitle: `共 ${gaps.total ?? 0} 项，未结清 ${gaps.open ?? 0} 项｜原因来自台账与实时状态推导`,
+    subtitle: `共 ${gaps.total ?? 0} 项，未结清 ${gaps.open ?? 0} 项｜按下载、解析、摘要、核验、冲突、非目标页等确定性分类`,
+    actions: '<button class="btn btn-sm" data-gap-triage>重新分类</button>',
     body: (gaps.items || []).length
-      ? `<ul class="list">${gaps.items.map((g) => `<li>
+      ? `${(gaps.optional_field_anomalies || []).length ? `<div class="callout callout-info"><b>可选字段异常不阻塞整条记录</b>
+          <p>${num(gaps.optional_field_anomalies.length)} 条企业名录的原始信用代码未通过 18 位/校验位规则：标准代码留空、原始值保留，企业名称仍计入名录；未关闭任何真实缺口。</p></div>` : ''}
+        <ul class="list">${gaps.items.map((g) => {
+          const t = g.triage || {};
+          const tone = t.tone || (g.severity === 'critical' ? 'danger' : 'warn');
+          const isClosed = g.status === 'closed' || g.status === 'resolved';
+          const isActive = g.status === 'open';
+          const isNonTarget = t.category === 'non_target' || g.classification === 'non_target';
+          const statusText = isClosed ? '历史已结清'
+            : g.status === 'mitigated' ? (isNonTarget ? '非目标页已排除' : '已缓解/继续跟踪')
+              : '未结清';
+          const statusTone = isClosed ? 'ok' : g.status === 'mitigated' ? 'muted' : 'warn';
+          const actions = isActive ? (t.supported_actions || []).map((a) =>
+            `<button class="btn btn-xs" data-gap-action="${esc(a.key)}" data-gap-id="${esc(g.id)}" title="${esc(a.description || '')}">${esc(a.label)}</button>`).join(' ') : '';
+          return `<li>
           <div class="list-head"><b>${esc(g.title)}</b>
-            ${chip(g.severity === 'critical' ? '关键' : g.severity === 'high' ? '高' : '一般', g.severity === 'critical' ? 'danger' : 'warn')}
-            ${chip(g.status === 'closed' ? '已结清' : '未结清', g.status === 'closed' ? 'ok' : 'warn')}
+            ${chip(t.label || '未分类', tone)}
+            ${isActive ? chip(t.blocking ? '阻塞核心数据' : '非阻塞', t.blocking ? 'warn' : 'muted') : ''}
+            ${chip(statusText, statusTone)}
           </div>
           <p class="muted">原因：${esc(g.reason || '—')}</p>
           <p class="muted">影响：${esc(g.impact || '—')}</p>
-          <p class="hint">自动处理：${esc(g.auto_action || '由每日自动任务重试与补全')}</p>
-          <p class="hint">${esc(g.raw_data_fix || '')}</p>
-        </li>`).join('')}</ul>`
+          <p class="hint">${isClosed ? '历史依据' : '依据'}：${esc((t.basis || []).join('；') || '—')}</p>
+          ${isActive ? `<p class="hint">自动处理：${esc(t.auto_action || g.auto_action || '由每日自动任务重试与补全')}</p>` : ''}
+          ${isActive && t.unsupported_reason ? `<p class="hint">没有可执行动作：${esc(t.unsupported_reason)}</p>` : ''}
+          ${actions ? `<div class="row-actions">${actions}</div>` : ''}
+          ${g.last_action ? `<p class="hint">${isClosed ? '结清记录' : '上次动作'}：${esc(g.last_action)}｜${esc(dateTime(g.last_action_at))}｜${esc(truncate(g.last_action_result || '—', 180))}</p>` : ''}
+        </li>`;
+        }).join('')}</ul>
+        ${(gaps.non_target_exclusions || []).length ? `<details class="tech-details"><summary>CEA 非目标页排除记录（${gaps.non_target_exclusions.length}）</summary>
+          <div class="tech-details-body"><ul class="bullets">${gaps.non_target_exclusions.slice(0, 12).map((x) => `<li><a class="link" href="${esc(x.url)}" target="_blank" rel="noreferrer noopener">${esc(truncate(x.url, 72))}</a>｜规则 <code>${esc(x.rule)}</code>｜快照 ${esc(x.snapshot_id || '—')}</li>`).join('')}</ul></div></details>` : ''}
+        <div id="gap-action-result"></div>`
       : emptyState('没有缺口记录'),
     note: gaps.note,
+  })}
+
+  ${card({
+    title: '入库摘要队列',
+    subtitle: ingest.enabled ? `已启用｜${Math.round((ingest.config?.interval_ms || 0) / 1000)} 秒周期｜单批 ≤${ingest.config?.batch_size || 3} 条 / ${Math.round((ingest.config?.budget_ms || 0) / 1000)} 秒｜与每日 06:30 调度独立` : `未启用｜${ingest.worker?.env_disabled ? '环境变量已停用（后台不可覆盖）' : '后台开关已暂停'}`,
+    actions: `<button class="btn btn-sm ${ingest.enabled ? '' : 'btn-primary'}" data-ingest-toggle="${ingest.enabled ? 'off' : 'on'}" ${ingest.worker?.env_disabled && !ingest.enabled ? 'disabled' : ''}>${ingest.enabled ? '暂停队列' : '启用队列'}</button>
+      <button class="btn btn-sm" data-ingest-backfill>补入漏队项</button>
+      <button class="btn btn-sm" data-ingest-retry>重试失败/阻塞</button>`,
+    body: `
+      <div class="metrics metrics-sm">
+        ${mini('待处理', (ingest.counts?.queued || 0) + (ingest.counts?.failed || 0) + (ingest.counts?.blocked || 0), '条', `当前可领取 ${ingest.due ?? 0} 条`)}
+        ${mini('运行中', ingest.counts?.running ?? 0, '条', ingest.worker?.running ? 'worker 正在处理' : '当前无运行任务')}
+        ${mini('已生成', ingest.counts?.succeeded ?? 0, '条', '摘要阶段完成，不代表核验通过')}
+        ${mini('失败/阻塞', (ingest.counts?.failed || 0) + (ingest.counts?.blocked || 0) + (ingest.counts?.dead || 0), '条', `尝试上限 ${ingest.config?.max_attempts || 5} 次`)}
+        ${mini('已失效/替换', ingest.counts?.superseded ?? 0, '条', '输入签名或模型键变化，旧任务不调用')}
+      </div>
+      <p class="hint">队列按“实际输入哈希 + 提示词版本 + 模型键”去重；摘要队列不读取页面、不在 GET 调模型。租约忙或进程重启只延后，不消耗真实失败次数。${ingest.worker?.last_error ? `最近错误：${esc(ingest.worker.last_error)}` : ''}</p>
+      ${(ingest.recent || []).length ? table({
+        rows: ingest.recent,
+        pageSize: 8,
+        columns: [
+          { key: 'entity_id', label: '条目', render: (r) => `<code>${esc(truncate(r.entity_id, 24))}</code>` },
+          { key: 'status', label: '状态', render: (r) => chip({ queued: '排队', running: '运行中', succeeded: '已生成', failed: '失败待重试', blocked: '阻塞', dead: '达到上限', superseded: '已失效' }[r.status] || r.status, r.status === 'succeeded' ? 'ok' : r.status === 'running' ? 'accent' : r.status === 'dead' ? 'danger' : 'warn') },
+          { key: 'attempts', label: '尝试', align: 'right', render: (r) => `${r.attempts}/${r.max_attempts}` },
+          { key: 'last_error', label: '失败原因', render: (r) => esc(truncate(r.last_error || '—', 46)) },
+          { key: 'next_attempt_at', label: '下次重试', render: (r) => esc(r.next_attempt_at ? dateTime(r.next_attempt_at) : '—') },
+          { key: 'updated_at', label: '更新时间', render: (r) => esc(dateTime(r.updated_at)) },
+        ],
+        emptyText: '尚未有入库摘要任务；新内容入库后自动出现',
+      }) : emptyState('尚未有入库摘要任务', '新内容入库后自动入队；只有标题、演示、转载副本与失败抓取不会入队。')}
+      <div id="ingest-result"></div>`,
+    note: '摘要成功只表示摘要阶段完成。正文范围与来源继续在详情中如实展示；不能把仅有来源摘要写成阅读全文。',
   })}
 
   ${card({
@@ -171,7 +236,7 @@ export async function renderMaintenance(body) {
       })}
       <div class="filters">
         <label class="fld"><span>域名</span><input type="search" id="dom-domain" placeholder="例如 mee.gov.cn"></label>
-        <label class="fld"><span>机构</span><input type="search" id="dom-label" placeholder="例如 生态环境部"></label>
+        <label class="fld"><span>机构</span><input type="search" id="dom-label" placeholder="例如 生态环境部" list="dom-label-options">${datalistHtml('dom-label-options', adminOptions.sources, '')}</label>
         <label class="fld"><span>类型</span><select id="dom-kind"><option value="official">政府/主管机构</option><option value="registry">登记系统</option><option value="exchange">交易机构</option></select></label>
         <label class="fld"><span>匹配</span><select id="dom-mode"><option value="subdomain">精确 + 受控子域</option><option value="exact">仅精确 hostname</option></select></label>
         <span class="fld-actions"><button class="btn btn-sm btn-primary" id="dom-save">保存</button><button class="btn btn-sm" id="dom-seed">补种内置登记</button></span>
@@ -200,7 +265,7 @@ export async function renderMaintenance(body) {
     note: chat.note,
   })}`;
 
-  bindMaintenance(body, d);
+  await bindMaintenance(body, d, q, adminOptions);
 }
 
 const RETRY_TARGETS = [
@@ -220,7 +285,7 @@ function stopSummaryPoll() {
   if (summaryPoll) { clearTimeout(summaryPoll); summaryPoll = null; }
 }
 
-function bindMaintenance(body, d) {
+async function bindMaintenance(body, d, q = {}, adminOptions = fallbackFormOptions().admin) {
   body.querySelector('[data-maint-refresh]')?.addEventListener('click', () => renderMaintenance(body));
 
   // 有界重试
@@ -250,6 +315,88 @@ function bindMaintenance(body, d) {
       btn.textContent = old;
     }
   }));
+
+  // 缺口受控动作：只提交一个明确动作；服务端返回真实执行结果，失败不伪造结清
+  const gapResult = () => body.querySelector('#gap-action-result');
+  body.querySelectorAll('[data-gap-action]').forEach((btn) => btn.addEventListener('click', async () => {
+    const id = btn.dataset.gapId;
+    const action = btn.dataset.gapAction;
+    const box = gapResult();
+    btn.disabled = true;
+    const old = btn.textContent;
+    btn.textContent = '执行中…';
+    if (box) box.innerHTML = `<p class="hint">正在执行「${esc(old)}」…</p>`;
+    try {
+      const out = await api(`/api/v2/admin/maintenance/gaps/${encodeURIComponent(id)}/action`, {
+        method: 'POST', body: { action },
+      });
+      const ok = out.ok !== false;
+      if (box) {
+        box.innerHTML = `<div class="callout ${ok ? 'callout-ok' : 'callout-warn'}">
+          <b>${ok ? '动作已执行' : '动作未成功/未结清'}</b>
+          <p>${esc(out.message || out.error || '—')}</p>
+          <p class="hint">状态：${esc(out.status || '—')}｜${out.closed ? '已按同一对象证据结清' : '缺口保持，除非同一对象证据已真实修复'}</p>
+        </div>`;
+      }
+      toast(ok ? '动作已执行（结果以页面为准）' : '动作未成功，缺口未结清', ok ? 'ok' : 'warn');
+      if (out.closed || out.status === 'mitigated') setTimeout(() => renderMaintenance(body), 1400);
+    } catch (e) {
+      if (box) box.innerHTML = errorState(e);
+      toast(e.body?.error || e.message, 'danger');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = old;
+    }
+  }));
+  body.querySelector('[data-gap-triage]')?.addEventListener('click', async (ev) => {
+    const btn = ev.currentTarget;
+    btn.disabled = true;
+    try {
+      const out = await api('/api/v2/admin/maintenance/gaps/triage', {
+        method: 'POST', body: { status: 'all', limit: 300 },
+      });
+      toast(`已重新分类 ${out.total || 0} 条缺口`, 'ok');
+      renderMaintenance(body);
+    } catch (e) {
+      toast(e.body?.error || e.message, 'danger');
+      btn.disabled = false;
+    }
+  });
+
+  // 入库摘要队列：开关 / 有界补入 / 有界重试失败项
+  const ingestBox = () => body.querySelector('#ingest-result');
+  const runIngestAction = async (btn, path, payload, label) => {
+    const box = ingestBox();
+    btn.disabled = true;
+    const old = btn.textContent;
+    btn.textContent = '执行中…';
+    if (box) box.innerHTML = `<p class="hint">正在执行「${esc(label)}」…</p>`;
+    try {
+      const out = await api(path, { method: 'POST', body: payload });
+      const q = out.queue_status || out.status || {};
+      if (box) {
+        box.innerHTML = `<div class="callout callout-ok"><b>${esc(label)}已执行</b>
+          <p>${esc(out.message || (out.queued !== undefined ? `补入 ${out.queued} 条，跳过 ${out.skipped || 0} 条` : out.reset !== undefined ? `重入 ${out.reset} 条` : `队列已${out.enabled ? '启用' : '暂停'}`))}</p>
+          <p class="hint">队列状态：待处理 ${(q.counts?.queued || 0) + (q.counts?.failed || 0) + (q.counts?.blocked || 0)} 条｜运行中 ${q.counts?.running || 0} 条。动作结果来自服务端实际执行。</p></div>`;
+      }
+      toast(`${label}完成`, 'ok');
+      setTimeout(() => renderMaintenance(body), 1600);
+    } catch (e) {
+      if (box) box.innerHTML = `<div class="callout callout-warn"><b>${esc(label)}未成功</b><p>${esc(e.body?.error || e.message)}</p></div>`;
+      toast(e.body?.error || e.message, 'danger');
+      btn.disabled = false;
+      btn.textContent = old;
+    }
+  };
+  body.querySelector('[data-ingest-toggle]')?.addEventListener('click', (ev) => {
+    const btn = ev.currentTarget;
+    runIngestAction(btn, '/api/v2/admin/summaries/queue/toggle', { enabled: btn.dataset.ingestToggle === 'on' },
+      btn.dataset.ingestToggle === 'on' ? '启用队列' : '暂停队列');
+  });
+  body.querySelector('[data-ingest-backfill]')?.addEventListener('click', (ev) =>
+    runIngestAction(ev.currentTarget, '/api/v2/admin/summaries/queue/backfill', { limit: 20 }, '补入漏队项'));
+  body.querySelector('[data-ingest-retry]')?.addEventListener('click', (ev) =>
+    runIngestAction(ev.currentTarget, '/api/v2/admin/summaries/queue/retry', { limit: 5 }, '重试失败/阻塞任务'));
 
   // 摘要批次：**异步任务 + 轮询**（202 + task_id）；全局单并发，按钮连点返回 409
   const runSummary = async (entityType) => {
@@ -348,15 +495,17 @@ function bindMaintenance(body, d) {
     const cur = p.current || {};
     formBox().innerHTML = card({
       title: `编辑：${esc(truncate(cur[p.fields?.find((f) => f.key === 'title') ? 'title' : 'id'] || cur.id, 40))}`,
-      subtitle: '只有下列白名单字段可修订；URL 仅接受 http(s)，含脚本载荷的值会被服务端拒绝',
+      subtitle: '只有下列白名单字段可修订；省份/地区/领域为有限选项，方法学与机构可自由输入，URL 保留原值；含脚本载荷的值会被服务端拒绝',
       body: `
         <div class="edit-grid">
-          ${fields.map((f) => `<label class="fld"><span>${esc(f.label)} <em>${esc(f.type)}</em></span>
-            <input data-edit-field="${esc(f.key)}" type="${f.type === 'date' ? 'date' : f.type === 'number' ? 'number' : 'text'}"
-              value="${esc(cur[f.key] === null || cur[f.key] === undefined ? '' : cur[f.key])}" maxlength="${f.max || 2000}">
+          ${fields.map((f) => `<label class="fld"><span>${esc(f.label)}</span>
+            ${editFieldControl(f, cur[f.key] === null || cur[f.key] === undefined ? '' : cur[f.key], adminOptions)}
             ${cur.original_values && f.key in (cur.original_values || {}) ? `<span class="hint">原始采集值：${esc(cur.original_values[f.key] ?? '（空）')}</span>` : ''}
           </label>`).join('')}
         </div>
+        ${datalistHtml('edit-methodology-options', adminOptions.methodologies, cur.methodology_id || '', { currentSuffix: '（当前值）' })}
+        ${datalistHtml('edit-source-options', adminOptions.sources, cur.issuing_authority || cur.publisher || cur.issuer || '', { currentSuffix: '（当前值）' })}
+        ${datalistHtml('edit-year-options', adminOptions.years, cur.data_year || '', { currentSuffix: '（当前值）' })}
         <label class="fld"><span>修订说明（写入审计）</span><input data-edit-note type="text" maxlength="500" placeholder="例如：修正来源链接为官方原文"></label>
         <div class="edit-actions">
           <button class="btn btn-primary" data-edit-submit>提交修订</button>
@@ -480,4 +629,21 @@ function bindMaintenance(body, d) {
       toast(err.body?.error || err.message, 'danger');
     }
   });
+
+  // 从信息治理详情跳转：预选实体并直接打开覆盖层编辑表单（不修改原始业务表）。
+  if (q.entity_type && q.entity_id) {
+    const typeEl = body.querySelector('#edit-type');
+    if (typeEl && [...typeEl.options].some((o) => o.value === q.entity_type)) {
+      typeEl.value = q.entity_type;
+      await loadEntities();
+      await openEditForm(q.entity_type, q.entity_id);
+      body.querySelector('#edit-form')?.scrollIntoView({ block: 'start' });
+    } else {
+      const box = body.querySelector('#edit-form');
+      if (box) {
+        box.innerHTML = `<div class="callout callout-warn"><b>该资料类型没有覆盖层编辑入口</b>
+          <p>${esc(q.entity_type)} 不在后台可编辑白名单内；请使用对应业务页面的维护入口，或回到治理详情查看。</p></div>`;
+      }
+    }
+  }
 }

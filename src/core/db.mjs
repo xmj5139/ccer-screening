@@ -65,6 +65,11 @@ const ACCOUNTING_SCHEMA_FILE = 'schema-accounting.sql';
 const PLATFORM_SCHEMA_FILE = 'schema-platform.sql';
 const DEEPSEEK_SCHEMA_FILE = 'schema-deepseek.sql';
 const REGIONAL_SCHEMA_FILE = 'schema-regional.sql';
+const GOVERNANCE_SCHEMA_FILE = 'schema-governance.sql';
+const INGEST_SCHEMA_FILE = 'schema-ingest.sql';
+const INTELLIGENCE_SCHEMA_FILE = 'schema-intelligence.sql';
+const INTELLIGENCE2_SCHEMA_FILE = 'schema-intelligence2.sql';
+const INTELLIGENCE3_SCHEMA_FILE = 'schema-intelligence3.sql';
 
 export function migrate(db) {
   const sql = readFileSync(join(__dirname, '..', 'db', 'schema.sql'), 'utf8');
@@ -222,6 +227,108 @@ export function migrate(db) {
     db.exec(readFileSync(regionalPath, 'utf8'));
     if (!getMeta(db, 'schema_version_regional_applied')) {
       setMeta(db, 'schema_version_regional_applied', nowIso());
+    }
+  }
+
+  // ---- v2.8 信息治理 / 历史补采 / 方法学版本（docs/74）----
+  // 纯新增表 + 幂等加列；版本号保持 2.7.0（与省域地图增量同一做法，不另发标签）。
+  const governancePath = join(__dirname, '..', 'db', GOVERNANCE_SCHEMA_FILE);
+  if (existsSync(governancePath)) {
+    db.exec(readFileSync(governancePath, 'utf8'));
+    if (!getMeta(db, 'schema_version_governance_applied')) {
+      setMeta(db, 'schema_version_governance_applied', nowIso());
+    }
+    // 方法学咨询期：允许显式记录，不要求所有版本都有；未知保持 NULL。
+    addColumnIfMissing(db, 'methodology_version', 'consultation_start', 'TEXT');
+    addColumnIfMissing(db, 'methodology_version', 'consultation_end', 'TEXT');
+  }
+
+  // ---- v2.9 入库即时摘要队列与缺口分流（docs/80）----
+  // 纯新增队列表与 CEA 非目标页排除表；数据缺口分类列与名录原始信用代码幂等补列。
+  const ingestPath = join(__dirname, '..', 'db', INGEST_SCHEMA_FILE);
+  if (existsSync(ingestPath)) {
+    db.exec(readFileSync(ingestPath, 'utf8'));
+    for (const [col, decl] of [
+      ['classification', 'TEXT'],
+      ['classification_basis', 'TEXT'],
+      ['retryable', 'INTEGER'],
+      ['blocking', 'INTEGER'],
+      ['classified_at', 'TEXT'],
+      ['last_action', 'TEXT'],
+      ['last_action_at', 'TEXT'],
+      ['last_action_result', 'TEXT'],
+      ['last_action_actor', 'TEXT'],
+    ]) {
+      addColumnIfMissing(db, 'data_gap', col, decl);
+    }
+    // 名录异常信用代码：标准代码留空，但原始异常值与规则提示必须保留；
+    // 企业名称照常计入名录，不能把字段级问题升级成整条缺失。
+    addColumnIfMissing(db, 'cea_entity', 'raw_credit_code', 'TEXT');
+    addColumnIfMissing(db, 'cea_entity', 'credit_code_valid', 'INTEGER');
+    if (!getMeta(db, 'schema_version_ingest_applied')) {
+      setMeta(db, 'schema_version_ingest_applied', nowIso());
+    }
+  }
+
+  // ---- v2.10 公开信息智能化第一阶段（docs/86）----
+  // 纯新增表 + 幂等加列。清洗/附件/事件组/字段证据/RSS 均独立存储，
+  // 不回写或删除既有 content_item / content_version 数据。
+  const intelligencePath = join(__dirname, '..', 'db', INTELLIGENCE_SCHEMA_FILE);
+  if (existsSync(intelligencePath)) {
+    db.exec(readFileSync(intelligencePath, 'utf8'));
+    for (const [col, decl] of [
+      ['body_fingerprint', 'TEXT'],
+      ['substantive_fingerprint', 'TEXT'],
+      ['attachment_fingerprint', 'TEXT'],
+      ['extractor', 'TEXT'],
+      ['extractor_version', 'TEXT'],
+      ['extraction_status', 'TEXT'],
+      ['extraction_note', 'TEXT'],
+      ['raw_html_hash', 'TEXT'],
+      ['cleaned_at', 'TEXT'],
+      ['event_group_id', 'TEXT'],
+    ]) {
+      addColumnIfMissing(db, 'content_item', col, decl);
+    }
+    for (const [col, decl] of [
+      ['body_fingerprint', 'TEXT'],
+      ['substantive_fingerprint', 'TEXT'],
+      ['attachment_fingerprint', 'TEXT'],
+      ['raw_html', 'TEXT'],
+      ['extractor', 'TEXT'],
+      ['extractor_version', 'TEXT'],
+      ['extraction_status', 'TEXT'],
+      ['extraction_note', 'TEXT'],
+    ]) {
+      addColumnIfMissing(db, 'content_version', col, decl);
+    }
+    if (!getMeta(db, 'schema_version_intelligence_applied')) {
+      setMeta(db, 'schema_version_intelligence_applied', nowIso());
+      setMeta(db, 'schema_version', '2.8.0');
+    }
+  }
+
+  // ---- v2.11 公开信息智能化第二阶段（docs/86）----
+  // FTS5 中文双字索引、用户关注/已读、PDF 表格 worker 任务表。
+  // 仍为纯新增表/虚拟表/触发器；不修改既有正文、用户与采集记录。
+  const intelligence2Path = join(__dirname, '..', 'db', INTELLIGENCE2_SCHEMA_FILE);
+  if (existsSync(intelligence2Path)) {
+    db.exec(readFileSync(intelligence2Path, 'utf8'));
+    if (!getMeta(db, 'schema_version_intelligence2_applied')) {
+      setMeta(db, 'schema_version_intelligence2_applied', nowIso());
+      setMeta(db, 'schema_version', '2.9.0');
+    }
+  }
+
+  // ---- v2.12 公开信息智能化第三阶段（docs/86）----
+  // dirty 队列/源表触发器、企业档案别名、语义扩展配额、第三方行情候选。
+  // 仍为纯新增表/索引/触发器；不写正式行情表，也不回填/覆盖业务表。
+  const intelligence3Path = join(__dirname, '..', 'db', INTELLIGENCE3_SCHEMA_FILE);
+  if (existsSync(intelligence3Path)) {
+    db.exec(readFileSync(intelligence3Path, 'utf8'));
+    if (!getMeta(db, 'schema_version_intelligence3_applied')) {
+      setMeta(db, 'schema_version_intelligence3_applied', nowIso());
+      setMeta(db, 'schema_version', '3.0.0');
     }
   }
 

@@ -38,6 +38,20 @@ export const V2_REQUIRED_TABLES = [
   'verification_result', 'auto_verify_rule', 'auto_verify_config', 'dataset_cursor',
   // v2.7 省域地图（docs/59）
   'region_emission',
+  // v2.8 信息治理 / 历史补采 / 方法学版本（docs/74）
+  'processing_stage', 'governance_lease', 'backfill_task', 'backfill_window',
+  'methodology_version_relation', 'methodology_version_diff',
+  // v2.10 公开信息智能化第一阶段（docs/86）
+  'content_extraction', 'content_attachment', 'content_event_group', 'content_event_member',
+  'field_evidence', 'rss_source', 'rss_candidate',
+  // v2.11 公开信息智能化第二阶段（docs/86）
+  'search_index_doc', 'search_index_fts', 'search_index_meta',
+  'user_follow_rule', 'user_follow_read',
+  'pdf_table_job', 'pdf_table_page', 'pdf_table',
+  // v2.12 公开信息智能化第三阶段（docs/86）
+  'search_index_dirty', 'cea_entity_alias',
+  'search_expansion_quota', 'search_expansion_log',
+  'market_candidate_import', 'market_candidate_row',
 ];
 
 /** 生产（在用）数据库的规范路径：任何 v2 命令都不允许指向它 */

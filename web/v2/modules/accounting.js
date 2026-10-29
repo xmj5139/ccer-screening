@@ -35,6 +35,7 @@ import {
   noteBlock, chip, kv, num, esc, truncate, shortDate, dateTime, metricCard, renderKvRows,
 } from '../ui.js';
 import { summaryBlock, summaryCoverageHint, sourceBlock, sourceLinkBlock } from '../platform.js';
+import { datalistHtml } from '../form-selects.js';
 
 /* ==================================================================== */
 /*  共享小工具                                                          */
@@ -379,8 +380,8 @@ export async function renderCarbonCalc(body, q) {
             </span>
             <small class="hint">单位由界面显式选择，服务端严格换算，不做隐式单位推断。</small></label>
           <label class="fld"><span>目标年度 <b class="req">必填</b></span>
-            <input type="number" min="1900" max="2100" step="1" data-el="target_year" placeholder="如 2025" required aria-label="目标年度">
-            <small class="hint">必填，取值 1900—2100；与因子数据年度不一致时需显式确认，不提供默认年度。</small></label>
+            <input type="number" min="1900" max="2100" step="1" data-el="target_year" placeholder="如 2025" required aria-label="目标年度" list="calc-target-year-options">
+            <small class="hint">必填，取值 1900—2100；与因子数据年度不一致时需显式确认，不提供默认年度。可参考因子库真实数据年度，但允许填其它年度。</small></label>
           <label class="fld"><span>因子数据年度</span>
             <select data-elf="data_year"><option value="">全部</option>${yearOptions}</select></label>
           <label class="fld"><span>因子口径类别</span>
@@ -391,6 +392,7 @@ export async function renderCarbonCalc(body, q) {
             <select data-el="factor_id" id="calc-factor-select">${initialFactorOptions}</select>
             <small class="hint">只列出 calculable = true 的因子；不会回落到全国平均值。</small></label>
         </div>
+        ${datalistHtml('calc-target-year-options', facets.data_years || [], '', { currentSuffix: '（因子数据年度）' })}
         <label class="fld" id="calc-accept-ref-row">
           <input type="checkbox" id="calc-accept-ref">
           接受使用参考年份因子（目标年度与因子数据年度不一致时必须由你显式勾选，系统不会自动带此标记重试）
